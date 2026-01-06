@@ -50,94 +50,199 @@ def close_telegram_client():
             telegram_client = None
             print("✅ Telegram client disconnected")
 
-def extract_fam_info(text, query=""):
-    """Extract FAM information from text file content"""
+def extract_fam_info_from_text(text):
+    """Extract FAM information from text content"""
     info = {}
     
     if not text:
         return info
     
-    # Check if this response is for our query
-    if query:
-        # Look for "Verified Data for: query" pattern
-        verified_pattern = rf'Verified Data for:\s*{re.escape(query)}'
-        if not re.search(verified_pattern, text, re.IGNORECASE):
-            # Also check for just the query in the text
-            if query.lower() not in text.lower():
-                print(f"⚠️ Text doesn't seem to be for query: {query}")
-                # Still try to parse, might be in file
+    print(f"🔍 Parsing text (length: {len(text)} chars)...")
     
-    # FAM ID - multiple patterns
-    patterns = [
-        r'FAM ID\s*[:=]\s*([^\n\r]+)',
-        r'FAM\s*[:=]\s*([^\n\r]+)',
-        r'ID\s*[:=]\s*([^\n\r]+)',
-        r'FAM\s+ID\s*[:=]\s*([^\n\r]+)'
-    ]
+    # Try multiple patterns for each field
+    patterns = {
+        'fam_id': [
+            r'FAM ID\s*[:=]\s*([^\n\r]+)',
+            r'FAM\s*[:=]\s*([^\n\r]+)',
+            r'ID\s*[:=]\s*([^\n\r]+)',
+            r'FAM\s+ID\s*[:=]\s*([^\n\r]+)'
+        ],
+        'name': [
+            r'NAME\s*[:=]\s*([^\n\r]+)',
+            r'Name\s*[:=]\s*([^\n\r]+)'
+        ],
+        'phone': [
+            r'PHONE\s*[:=]\s*([^\n\r]+)',
+            r'Phone\s*[:=]\s*([^\n\r]+)',
+            r'Mobile\s*[:=]\s*([^\n\r]+)',
+            r'Contact\s*[:=]\s*([^\n\r]+)'
+        ],
+        'type': [
+            r'TYPE\s*[:=]\s*([^\n\r]+)',
+            r'Type\s*[:=]\s*([^\n\r]+)',
+            r'Category\s*[:=]\s*([^\n\r]+)'
+        ]
+    }
     
-    for pattern in patterns:
-        fam_match = re.search(pattern, text, re.IGNORECASE)
-        if fam_match:
-            info['fam_id'] = fam_match.group(1).strip()
-            break
+    for field, field_patterns in patterns.items():
+        for pattern in field_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                info[field] = match.group(1).strip()
+                print(f"   ✅ Found {field}: {info[field]}")
+                break
     
-    # If no fam_id found but we have query, use query
-    if not info.get('fam_id') and query:
-        info['fam_id'] = query
-    
-    # NAME
-    name_match = re.search(r'NAME\s*[:=]\s*([^\n\r]+)', text, re.IGNORECASE)
-    if name_match:
-        info['name'] = name_match.group(1).strip()
-    
-    # PHONE
-    phone_match = re.search(r'PHONE\s*[:=]\s*([^\n\r]+)', text, re.IGNORECASE)
-    if phone_match:
-        info['phone'] = phone_match.group(1).strip()
-    
-    # TYPE
-    type_match = re.search(r'TYPE\s*[:=]\s*([^\n\r]+)', text, re.IGNORECASE)
-    if type_match:
-        info['type'] = type_match.group(1).strip().lower()
+    # If no patterns matched, try line-by-line parsing
+    if not info:
+        print("   ⚠️ No pattern matches, trying line-by-line...")
+        lines = text.split('\n')
+        for line in lines:
+            line = line.strip()
+            if ':' in line:
+                key, value = line.split(':', 1)
+                key = key.strip().lower()
+                value = value.strip()
+                
+                if 'fam' in key and 'id' in key:
+                    info['fam_id'] = value
+                elif 'name' in key:
+                    info['name'] = value
+                elif 'phone' in key:
+                    info['phone'] = value
+                elif 'type' in key:
+                    info['type'] = value
     
     return info
 
-def download_and_read_file(client, message):
-    """Download and read the attached .txt file"""
+def download_txt_file(client, message):
+    """Download and read .txt file from bot message"""
     try:
-        print(f"📥 Downloading file from message ID: {message.id}")
+        if not message.media:
+            print("   ⚠️ No media attached to message")
+            return None
         
-        # Create a temporary file
+        print(f"   📥 Downloading .txt file from message {message.id}...")
+        
+        # Create a temporary file with .txt extension
         with tempfile.NamedTemporaryFile(mode='w+b', delete=False, suffix='.txt') as tmp:
             temp_path = tmp.name
         
-        # Download the file
-        download_result = client.download_media(message, file=temp_path)
+        # Download the media (should be a .txt file)
+        result_path = client.download_media(message, file=temp_path)
+        final_path = result_path if result_path else temp_path
         
-        # Read the file content
-        with open(temp_path, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
+        print(f"   💾 Downloaded to: {final_path}")
         
-        # Clean up
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        # Try different encodings
+        encodings = ['utf-8', 'latin-1', 'iso-8859-1', 'cp1252']
+        file_content = None
         
-        print(f"📄 Read {len(content)} characters from file")
-        return content
+        for encoding in encodings:
+            try:
+                with open(final_path, 'r', encoding=encoding) as f:
+                    file_content = f.read()
+                print(f"   ✅ Successfully read with {encoding} encoding")
+                break
+            except UnicodeDecodeError:
+                continue
+            except Exception as e:
+                print(f"   ⚠️ Error reading with {encoding}: {e}")
+                continue
         
+        # If all encodings fail, try with errors ignore
+        if not file_content:
+            try:
+                with open(final_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    file_content = f.read()
+                print(f"   ⚠️ Read with errors ignored")
+            except Exception as e:
+                print(f"   ❌ Could not read file: {e}")
+                file_content = None
+        
+        # Clean up temp file
+        try:
+            if os.path.exists(final_path):
+                os.remove(final_path)
+        except:
+            pass
+        
+        if file_content:
+            print(f"   📄 File content length: {len(file_content)} chars")
+            print(f"   📄 First 500 chars: {file_content[:500]}...")
+            return file_content
+        else:
+            print("   ❌ No content read from file")
+            return None
+            
     except Exception as e:
-        print(f"❌ Error downloading/reading file: {e}")
+        print(f"   ❌ Error downloading file: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
-def wait_for_bot_response(client, sent_message_id, query, max_wait=30):
+def check_message_for_query_data(client, message, query):
+    """Check if a message contains data for our query"""
+    try:
+        # Get sender info
+        sender = client.get_entity(message.sender_id)
+        if not (hasattr(sender, 'bot') and sender.bot):
+            return None
+        
+        print(f"\n🤖 Checking bot message ID: {message.id}")
+        
+        # Check message text for query match
+        message_text = message.message or ""
+        has_query_in_text = query.lower() in message_text.lower()
+        
+        # Check if message has media (.txt file)
+        has_media = bool(message.media)
+        
+        print(f"   📝 Text preview: {message_text[:100]}")
+        print(f"   🔍 Query in text: {has_query_in_text}")
+        print(f"   📎 Has media: {has_media}")
+        
+        # Priority 1: Check attached .txt file
+        if has_media:
+            print("   📁 Checking attached file...")
+            file_content = download_txt_file(client, message)
+            
+            if file_content:
+                # Check if file contains our query
+                if query.lower() in file_content.lower():
+                    print(f"   ✅ File contains our query: {query}")
+                    return extract_fam_info_from_text(file_content)
+                else:
+                    print(f"   ⚠️ File doesn't contain query: {query}")
+                    # Still check if it has FAM data
+                    if any(keyword in file_content.upper() for keyword in ['FAM ID', 'NAME:', 'PHONE:', 'TYPE:']):
+                        print(f"   ✅ File has FAM data (might be for different query)")
+                        return extract_fam_info_from_text(file_content)
+        
+        # Priority 2: Check message text
+        if has_query_in_text and message_text.strip():
+            print(f"   ✅ Message text contains query: {query}")
+            # Check if text has actual data (not just "Verified Data for:")
+            if any(keyword in message_text.upper() for keyword in ['FAM ID', 'NAME:', 'PHONE:', 'TYPE:']):
+                return extract_fam_info_from_text(message_text)
+            else:
+                print(f"   ⚠️ Message text has query but no FAM data")
+        
+        return None
+        
+    except Exception as e:
+        print(f"   ❌ Error checking message: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def wait_for_bot_response_with_file(client, sent_message_id, query, max_wait=30):
     """
-    Wait for bot response that matches our query
-    Returns (success, data) tuple
+    Wait for bot response with .txt file that matches our query
     """
     start_time = time.time()
     last_checked_id = sent_message_id
     
-    print(f"⏳ Waiting for bot response (max {max_wait}s)...")
+    print(f"⏳ Waiting for bot response with .txt file (max {max_wait}s)...")
     
     while time.time() - start_time < max_wait:
         try:
@@ -149,74 +254,39 @@ def wait_for_bot_response(client, sent_message_id, query, max_wait=30):
             )
             
             if messages:
-                last_checked_id = max(last_checked_id, max(m.id for m in messages) if messages else last_checked_id)
+                # Update last checked ID
+                new_max_id = max(m.id for m in messages)
+                if new_max_id > last_checked_id:
+                    last_checked_id = new_max_id
+                    print(f"📨 Got {len(messages)} new messages, last ID: {last_checked_id}")
             
+            # Check each message
             for message in messages:
-                try:
-                    # Check if message is from a bot
-                    sender = client.get_entity(message.sender_id)
-                    if not (hasattr(sender, 'bot') and sender.bot):
-                        continue
-                    
-                    print(f"🤖 Found bot message ID: {message.id}")
-                    print(f"   📝 Text: {message.message[:100] if message.message else 'No text'}")
-                    print(f"   📎 Has media: {bool(message.media)}")
-                    
-                    # Check if this is for our query
-                    is_for_our_query = False
-                    message_content = ""
-                    
-                    # Check message text first
-                    if message.message and query.lower() in message.message.lower():
-                        print(f"   ✅ Message text contains our query: {query}")
-                        is_for_our_query = True
-                        message_content = message.message
-                    
-                    # Check file content if available
-                    if message.media and not is_for_our_query:
-                        print("   📁 Checking file content...")
-                        file_content = download_and_read_file(client, message)
-                        
-                        if file_content:
-                            # Check if file is for our query
-                            if query.lower() in file_content.lower():
-                                print(f"   ✅ File content contains our query: {query}")
-                                is_for_our_query = True
-                                message_content = file_content
-                            else:
-                                print(f"   ⚠️ File is not for our query")
-                    
-                    # If we found our data, parse and return it
-                    if is_for_our_query and message_content:
-                        print(f"   🎯 Found matching response for query: {query}")
-                        fam_data = extract_fam_info(message_content, query)
-                        
-                        if fam_data and (fam_data.get('fam_id') or fam_data.get('name') or fam_data.get('phone')):
-                            print(f"   ✅ Successfully parsed FAM data")
-                            return True, fam_data
-                        else:
-                            print(f"   ⚠️ Could not parse FAM data from response")
-                    
-                except Exception as e:
-                    print(f"⚠️ Error processing message {message.id}: {e}")
-                    continue
+                fam_data = check_message_for_query_data(client, message, query)
+                if fam_data:
+                    return True, fam_data
             
-            # If no messages yet, wait a bit
-            if not messages:
-                elapsed = time.time() - start_time
-                print(f"⏰ No new messages yet... ({elapsed:.1f}s elapsed)")
-                time.sleep(1)  # Check more frequently
+            # If no valid messages yet, wait
+            elapsed = time.time() - start_time
+            if elapsed > 5 and elapsed < max_wait - 5:
+                print(f"⏰ Still waiting... ({elapsed:.1f}s elapsed)")
+            
+            # Check more frequently at first, then slower
+            if elapsed < 10:
+                time.sleep(1)  # Check every second for first 10 seconds
+            else:
+                time.sleep(2)  # Then check every 2 seconds
             
         except Exception as e:
-            print(f"⚠️ Error getting messages: {e}")
+            print(f"⚠️ Error in wait loop: {e}")
             time.sleep(2)
     
     print(f"⏰ Timeout after {max_wait} seconds")
     return False, None
 
-def get_fam_data_from_telegram_fast(query):
+def get_fam_data_with_file(query):
     """
-    Fast version: Send command and wait for matching response
+    Get FAM data by downloading bot's .txt file
     """
     client = None
     try:
@@ -228,20 +298,35 @@ def get_fam_data_from_telegram_fast(query):
         
         # Send command
         command = f"/fam {query}"
-        print(f"📤 Sending to chat {chat_id}: {command}")
+        print(f"\n📤 Sending to chat {chat_id}: {command}")
         
-        # Send message and save its ID
+        # Send message
         sent_message = client.send_message(chat_id, command)
         sent_message_id = sent_message.id
         print(f"📨 Sent message ID: {sent_message_id}")
         
-        # Wait for bot response that matches our query
-        success, fam_data = wait_for_bot_response(client, sent_message_id, query, max_wait=25)
+        # Wait for bot response with .txt file
+        success, fam_data = wait_for_bot_response_with_file(
+            client, sent_message_id, query, max_wait=35
+        )
         
         if success:
+            print(f"✅ Successfully extracted data for: {query}")
             return fam_data
         else:
-            print(f"❌ No matching response found for query: {query}")
+            print(f"❌ No .txt file data found for query: {query}")
+            
+            # Last resort: check recent messages for any data
+            print("🔄 Checking recent messages as last resort...")
+            messages = client.get_messages(chat_id, limit=20)
+            
+            for message in messages:
+                if message.id > sent_message_id:
+                    fam_data = check_message_for_query_data(client, message, query)
+                    if fam_data:
+                        print(f"✅ Found data in recent messages")
+                        return fam_data
+            
             return None
         
     except Exception as e:
@@ -251,10 +336,10 @@ def get_fam_data_from_telegram_fast(query):
         raise
     
     finally:
-        # Don't disconnect - keep connection alive
+        # Keep connection alive
         pass
 
-# Cache to prevent duplicate queries
+# Cache system
 response_cache = {}
 cache_lock = threading.Lock()
 CACHE_TIMEOUT = 300  # 5 minutes
@@ -268,7 +353,6 @@ def get_cached_response(query):
                 print(f"💾 Using cached response for: {query}")
                 return cached_data
             else:
-                # Remove expired cache
                 del response_cache[query]
     return None
 
@@ -280,7 +364,7 @@ def set_cached_response(query, data):
 
 @app.route('/api', methods=['GET'])
 def get_fam_info():
-    """API endpoint - fast response with query matching"""
+    """Main API endpoint - downloads .txt file from bot"""
     query = request.args.get('fam', '').strip()
     
     if not query:
@@ -290,9 +374,9 @@ def get_fam_info():
             'example': '/api?fam=sugarsingh@fam'
         }), 400
     
-    print(f"\n" + "="*60)
-    print(f"🔍 Processing request for: {query}")
-    print("="*60)
+    print(f"\n" + "="*70)
+    print(f"🎯 API Request for: {query}")
+    print("="*70)
     
     # Check cache first
     cached_data = get_cached_response(query)
@@ -306,9 +390,13 @@ def get_fam_info():
         })
     
     try:
-        fam_data = get_fam_data_from_telegram_fast(query)
+        fam_data = get_fam_data_with_file(query)
         
         if fam_data and (fam_data.get('fam_id') or fam_data.get('name') or fam_data.get('phone')):
+            # Ensure fam_id is set
+            if not fam_data.get('fam_id'):
+                fam_data['fam_id'] = query
+            
             # Cache the response
             set_cached_response(query, fam_data)
             
@@ -322,9 +410,9 @@ def get_fam_info():
         else:
             return jsonify({
                 'success': False,
-                'error': 'No FAM information found for this query',
+                'error': 'No FAM information found in bot\'s .txt file',
                 'query': query,
-                'note': 'Bot may be responding with data for a different query'
+                'note': 'The bot may not have responded with a .txt file'
             }), 404
             
     except Exception as e:
@@ -335,177 +423,142 @@ def get_fam_info():
             'query': query
         }), 500
 
-@app.route('/api/stream', methods=['GET'])
-def get_fam_info_stream():
-    """
-    Streaming API endpoint - returns immediate updates
-    Uses Server-Sent Events (SSE)
-    """
+@app.route('/api/debug', methods=['GET'])
+def debug_api():
+    """Debug endpoint to see what bot sends"""
     query = request.args.get('fam', '').strip()
     
     if not query:
-        return jsonify({
-            'success': False,
-            'error': 'Missing fam parameter'
-        }), 400
+        return jsonify({'error': 'Missing fam parameter'}), 400
     
-    def generate():
-        """Generate SSE events"""
-        import time
-        import json
+    try:
+        client = get_telegram_client()
+        chat_id = -1003674153946
         
-        # Initial response
-        yield f"data: {json.dumps({'status': 'started', 'query': query, 'timestamp': time.time()})}\n\n"
+        # Send command
+        command = f"/fam {query}"
+        sent_message = client.send_message(chat_id, command)
         
-        # Check cache first
-        cached_data = get_cached_response(query)
-        if cached_data:
-            yield f"data: {json.dumps({'status': 'cached', 'query': query, 'data': cached_data, 'timestamp': time.time()})}\n\n"
-            return
+        # Wait for response
+        time.sleep(12)
         
-        try:
-            client = get_telegram_client()
-            chat_id = -1003674153946
-            
-            # Send command
-            command = f"/fam {query}"
-            sent_message = client.send_message(chat_id, command)
-            sent_message_id = sent_message.id
-            
-            yield f"data: {json.dumps({'status': 'sent', 'message_id': sent_message_id, 'timestamp': time.time()})}\n\n"
-            
-            # Wait for response
-            start_time = time.time()
-            max_wait = 30
-            last_checked_id = sent_message_id
-            
-            while time.time() - start_time < max_wait:
-                # Check for new messages
-                messages = client.get_messages(chat_id, min_id=last_checked_id, limit=5)
-                
-                if messages:
-                    last_checked_id = max(last_checked_id, max(m.id for m in messages))
-                    
-                    for message in messages:
-                        try:
-                            sender = client.get_entity(message.sender_id)
-                            if hasattr(sender, 'bot') and sender.bot:
-                                # Check if this is for our query
-                                if message.message and query.lower() in message.message.lower():
-                                    yield f"data: {json.dumps({'status': 'bot_response', 'message': message.message[:100], 'timestamp': time.time()})}\n\n"
-                                    
-                                    # Parse and return data
-                                    fam_data = extract_fam_info(message.message, query)
-                                    if fam_data:
-                                        set_cached_response(query, fam_data)
-                                        yield f"data: {json.dumps({'status': 'success', 'data': fam_data, 'timestamp': time.time()})}\n\n"
-                                        return
-                        
-                        except:
-                            continue
-                
-                # Send heartbeat
-                yield f"data: {json.dumps({'status': 'waiting', 'elapsed': time.time() - start_time, 'timestamp': time.time()})}\n\n"
-                time.sleep(1)
-            
-            # Timeout
-            yield f"data: {json.dumps({'status': 'timeout', 'query': query, 'timestamp': time.time()})}\n\n"
-            
-        except Exception as e:
-            yield f"data: {json.dumps({'status': 'error', 'error': str(e), 'timestamp': time.time()})}\n\n"
-    
-    return app.response_class(
-        generate(),
-        mimetype='text/event-stream',
-        headers={
-            'Cache-Control': 'no-cache',
-            'X-Accel-Buffering': 'no'  # Disable buffering for nginx
+        # Get messages
+        messages = client.get_messages(chat_id, limit=15)
+        
+        debug_info = {
+            'query': query,
+            'our_message_id': sent_message.id,
+            'bot_responses': []
         }
-    )
+        
+        for msg in messages:
+            if msg.id > sent_message.id:
+                try:
+                    sender = client.get_entity(msg.sender_id)
+                    is_bot = hasattr(sender, 'bot') and sender.bot
+                    
+                    resp = {
+                        'id': msg.id,
+                        'date': str(msg.date),
+                        'is_bot': is_bot,
+                        'text': msg.message or '',
+                        'has_media': bool(msg.media),
+                        'media_info': str(type(msg.media)) if msg.media else None
+                    }
+                    
+                    # Try to download file if present
+                    if msg.media and is_bot:
+                        try:
+                            with tempfile.NamedTemporaryFile(mode='w+b', delete=False, suffix='.txt') as tmp:
+                                temp_path = tmp.name
+                            
+                            client.download_media(msg, file=temp_path)
+                            
+                            # Try to read
+                            try:
+                                with open(temp_path, 'r', encoding='utf-8') as f:
+                                    content = f.read()
+                                resp['file_content_preview'] = content[:1000]
+                                resp['file_length'] = len(content)
+                                
+                                # Check for query in file
+                                resp['query_in_file'] = query.lower() in content.lower()
+                                
+                                # Check for FAM data patterns
+                                resp['has_fam_patterns'] = any(
+                                    pattern in content.upper() 
+                                    for pattern in ['FAM ID', 'NAME:', 'PHONE:', 'TYPE:']
+                                )
+                                
+                            except:
+                                resp['file_error'] = 'Could not read file'
+                            
+                            # Clean up
+                            if os.path.exists(temp_path):
+                                os.remove(temp_path)
+                                
+                        except Exception as file_e:
+                            resp['file_error'] = str(file_e)
+                    
+                    debug_info['bot_responses'].append(resp)
+                    
+                except Exception as e:
+                    debug_info['bot_responses'].append({
+                        'id': msg.id,
+                        'error': str(e)
+                    })
+        
+        return jsonify(debug_info)
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/health', methods=['GET'])
 def health():
-    """Simple health check"""
+    """Health check"""
     return jsonify({
         'status': 'ok',
-        'service': 'FAM API',
+        'service': 'FAM API (.txt file version)',
         'timestamp': time.time(),
         'cache_size': len(response_cache)
     })
-
-@app.route('/cache/clear', methods=['GET'])
-def clear_cache():
-    """Clear response cache"""
-    with cache_lock:
-        count = len(response_cache)
-        response_cache.clear()
-    
-    return jsonify({
-        'success': True,
-        'message': f'Cache cleared ({count} entries removed)',
-        'timestamp': time.time()
-    })
-
-@app.route('/cache/stats', methods=['GET'])
-def cache_stats():
-    """Get cache statistics"""
-    with cache_lock:
-        stats = {
-            'size': len(response_cache),
-            'queries': list(response_cache.keys()),
-            'entries': []
-        }
-        
-        for query, (cached_time, data) in response_cache.items():
-            stats['entries'].append({
-                'query': query,
-                'cached_time': cached_time,
-                'age_seconds': time.time() - cached_time,
-                'data_keys': list(data.keys()) if data else []
-            })
-    
-    return jsonify(stats)
 
 @app.route('/')
 def home():
     """Home page"""
     return jsonify({
         'service': 'Telegram FAM API',
-        'description': 'Fast API that matches bot responses with queries',
-        'features': [
-            'Query matching: Ensures bot response is for the correct query',
-            'Fast response: Returns data as soon as bot sends it',
-            'Caching: Prevents duplicate requests',
-            'Streaming: Real-time updates via /api/stream endpoint'
-        ],
+        'description': 'Downloads and reads .txt files from bot responses',
+        'important': 'The bot sends data in attached .txt files, not in message text',
         'usage': 'GET /api?fam=upi@fam',
-        'example': f'/api?fam=sugarsingh@fam',
-        'streaming_example': f'/api/stream?fam=sugarsingh@fam',
-        'endpoints': {
-            '/api': 'Get FAM information (fast with cache)',
-            '/api/stream': 'Streaming API for real-time updates',
-            '/health': 'Health check',
-            '/cache/clear': 'Clear response cache',
-            '/cache/stats': 'Cache statistics'
+        'debug': 'GET /api/debug?fam=upi@fam (see what bot actually sends)',
+        'example_response': {
+            'success': True,
+            'query': 'sugarsingh@fam',
+            'data': {
+                'fam_id': 'sugarsingh@fam',
+                'name': 'Siddhartha S',
+                'phone': '7993764802',
+                'type': 'contact'
+            }
         }
     })
 
-# Close connection when app shuts down
+# Close connection on shutdown
 import atexit
 atexit.register(close_telegram_client)
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 10000))
-    print(f"🚀 Starting FAST FAM API on port {port}")
+    print(f"🚀 Starting TXT FILE FAM API on port {port}")
     print(f"📱 Target group: -1003674153946")
-    print(f"🎯 Features: Query matching, caching, fast responses")
+    print(f"📄 Bot sends: Message + .txt file attachment")
+    print(f"🎯 Will download and parse .txt files")
     
-    # Try to initialize Telegram client on startup
     try:
         get_telegram_client()
         print("✅ Pre-initialized Telegram client")
     except Exception as e:
         print(f"⚠️ Telegram initialization deferred: {e}")
     
-    # Run with single worker, no threading
     app.run(host='0.0.0.0', port=port, debug=False, threaded=False)
