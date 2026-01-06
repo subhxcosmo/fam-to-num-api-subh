@@ -3,7 +3,7 @@ services:
     name: telegram-fam-api
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python app.py
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 120
     envVars:
       - key: TELEGRAM_API_ID
         sync: false
@@ -11,5 +11,7 @@ services:
         sync: false
       - key: TELEGRAM_SESSION_STRING
         sync: false
-      - key: PYTHON_VERSION
-        value: 3.9.0
+      - key: PORT
+        value: 10000
+      - key: PYTHONUNBUFFERED
+        value: "true"
