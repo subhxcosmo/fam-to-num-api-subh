@@ -5,3 +5,4 @@ requests
 pysocks
 cryptg
 gunicorn
+supabase
