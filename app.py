@@ -13,14 +13,8 @@ load_dotenv()
 
 app = Flask(__name__)
 
-# Initialize Telegram bot with error handling
-telegram_bot = None
-try:
-    telegram_bot = TelegramFamBot()
-    print("✅ Telegram bot initialized successfully")
-except Exception as e:
-    print(f"⚠️ Warning: Could not initialize Telegram bot: {e}")
-    print("⚠️ API will work but Telegram features will be unavailable")
+# Initialize Telegram bot
+telegram_bot = TelegramFamBot()
 
 # Lock for thread-safe operations
 bot_lock = Lock()
@@ -30,22 +24,22 @@ def parse_fam_info(text):
     info = {}
     
     # Extract FAM ID
-    fam_match = re.search(r'FAM ID\s*:\s*([^\n]+)', text, re.IGNORECASE)
+    fam_match = re.search(r'FAM ID\s*:\s*([^\n]+)', text)
     if fam_match:
         info['fam_id'] = fam_match.group(1).strip()
     
     # Extract NAME
-    name_match = re.search(r'NAME\s*:\s*([^\n]+)', text, re.IGNORECASE)
+    name_match = re.search(r'NAME\s*:\s*([^\n]+)', text)
     if name_match:
         info['name'] = name_match.group(1).strip()
     
     # Extract PHONE
-    phone_match = re.search(r'PHONE\s*:\s*([^\n]+)', text, re.IGNORECASE)
+    phone_match = re.search(r'PHONE\s*:\s*([^\n]+)', text)
     if phone_match:
         info['phone'] = phone_match.group(1).strip()
     
     # Extract TYPE
-    type_match = re.search(r'TYPE\s*:\s*([^\n]+)', text, re.IGNORECASE)
+    type_match = re.search(r'TYPE\s*:\s*([^\n]+)', text)
     if type_match:
         info['type'] = type_match.group(1).strip().lower()
     
@@ -62,19 +56,6 @@ def get_fam_info():
             'error': 'Missing fam parameter. Use /api?fam=upi@fam',
             'example': '/api?fam=sugarsingh@fam'
         }), 400
-    
-    if telegram_bot is None:
-        return jsonify({
-            'success': False,
-            'error': 'Telegram bot not initialized. Check environment variables.',
-            'query': query,
-            'mock_data': {
-                'fam_id': query,
-                'name': 'Mock User',
-                'phone': '1234567890',
-                'type': 'contact'
-            }
-        }), 503
     
     try:
         with bot_lock:
@@ -121,11 +102,9 @@ def get_fam_info():
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint for Render"""
-    telegram_status = "connected" if telegram_bot and telegram_bot.client.is_connected() else "disconnected"
     return jsonify({
         'status': 'healthy',
-        'service': 'Telegram FAM API',
-        'telegram': telegram_status
+        'service': 'Telegram FAM API'
     })
 
 @app.route('/', methods=['GET'])
@@ -139,22 +118,18 @@ def index():
             '/api': 'Get FAM information',
             '/health': 'Health check',
             '/': 'This page'
-        },
-        'telegram_status': 'ready' if telegram_bot else 'not_configured'
+        }
     })
 
 if __name__ == '__main__':
-    # Initialize Telegram bot connection if available
-    if telegram_bot:
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(telegram_bot.connect())
-            print("✅ Telegram bot connected successfully")
-        except Exception as e:
-            print(f"⚠️ Warning: Could not connect to Telegram: {e}")
-    else:
-        print("⚠️ Running without Telegram bot (mock mode)")
+    # Initialize Telegram bot connection
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(telegram_bot.connect())
+        print("✅ Telegram bot connected successfully")
+    except Exception as e:
+        print(f"⚠️ Warning: Could not connect to Telegram: {e}")
     
     # Run Flask app
     port = int(os.environ.get('PORT', 5000))
