@@ -2,195 +2,263 @@ import os
 import re
 import time
 import json
-import csv
 import tempfile
 import threading
+import csv
+import io
 from datetime import datetime
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
-import requests
+
+# Try to import Supabase
+try:
+    from supabase import create_client, Client
+    SUPABASE_AVAILABLE = True
+except ImportError:
+    SUPABASE_AVAILABLE = False
+    print("⚠️ Supabase not installed, using local JSON storage")
 
 load_dotenv()
 
 app = Flask(__name__)
 
-# ========== DATABASE CONFIGURATION ==========
-# Using Supabase (free tier) for storage
-SUPABASE_URL = os.getenv('SUPABASE_URL', '')
-SUPABASE_KEY = os.getenv('SUPABASE_KEY', '')
-SUPABASE_TABLE = 'fam_data'
-USE_DATABASE = bool(SUPABASE_URL and SUPABASE_KEY)
-
-# Local storage files
-JSON_DB_FILE = 'fam_database.json'
-CSV_DB_FILE = 'fam_database.csv'
-QUERY_COUNTER_FILE = 'query_counter.txt'
-
-# Telegram client
+# Telegram client will be initialized only when needed
 telegram_client = None
 client_lock = threading.Lock()
 
-# Query counter for every 200th query
-query_counter = 0
-counter_lock = threading.Lock()
+# Database instance
+supabase = None
+USE_SUPABASE = False
 
-# ========== DATABASE FUNCTIONS ==========
-def init_local_database():
-    """Initialize local JSON and CSV databases if they don't exist"""
-    if not os.path.exists(JSON_DB_FILE):
-        with open(JSON_DB_FILE, 'w') as f:
-            json.dump({}, f)
+# Local JSON storage as fallback
+DATA_FILE = "fam_data.json"
+CSV_FILE = "fam_data.csv"
+
+def init_database():
+    """Initialize database connection"""
+    global supabase, USE_SUPABASE
     
-    if not os.path.exists(CSV_DB_FILE):
-        with open(CSV_DB_FILE, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['fam_id', 'name', 'phone', 'type', 'breached_timestamp', 'created_at'])
-
-def load_query_counter():
-    """Load query counter from file"""
-    global query_counter
-    try:
-        if os.path.exists(QUERY_COUNTER_FILE):
-            with open(QUERY_COUNTER_FILE, 'r') as f:
-                query_counter = int(f.read().strip())
-    except:
-        query_counter = 0
-    return query_counter
-
-def save_query_counter():
-    """Save query counter to file"""
-    global query_counter
-    try:
-        with open(QUERY_COUNTER_FILE, 'w') as f:
-            f.write(str(query_counter))
-    except:
-        pass
-
-def increment_query_counter():
-    """Increment and save query counter"""
-    global query_counter
-    with counter_lock:
-        query_counter += 1
-        save_query_counter()
-        return query_counter
-
-def store_in_supabase(fam_data):
-    """Store data in Supabase database"""
-    if not USE_DATABASE:
-        return False
-    
-    try:
-        headers = {
-            'apikey': SUPABASE_KEY,
-            'Authorization': f'Bearer {SUPABASE_KEY}',
-            'Content-Type': 'application/json',
-            'Prefer': 'return=minimal'
-        }
+    if SUPABASE_AVAILABLE:
+        supabase_url = os.getenv('SUPABASE_URL', '')
+        supabase_key = os.getenv('SUPABASE_KEY', '')
         
-        # Prepare data for Supabase
-        supabase_data = {
-            'fam_id': fam_data.get('fam_id', ''),
-            'name': fam_data.get('name', ''),
-            'phone': fam_data.get('phone', ''),
-            'type': fam_data.get('type', 'contact'),
-            'breached_timestamp': fam_data.get('breached_timestamp', time.time()),
-            'created_at': datetime.utcnow().isoformat()
-        }
-        
-        # Insert into Supabase
-        response = requests.post(
-            f'{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}',
-            headers=headers,
-            json=supabase_data
-        )
-        
-        if response.status_code in [200, 201]:
-            print(f"✅ Stored in Supabase: {fam_data.get('fam_id')}")
-            return True
+        if supabase_url and supabase_key:
+            try:
+                supabase = create_client(supabase_url, supabase_key)
+                print("✅ Connected to Supabase")
+                USE_SUPABASE = True
+                
+                # Create table if not exists
+                create_table_query = """
+                CREATE TABLE IF NOT EXISTS fam_records (
+                    id SERIAL PRIMARY KEY,
+                    fam_id TEXT UNIQUE NOT NULL,
+                    name TEXT,
+                    phone TEXT,
+                    type TEXT,
+                    breached_timestamp DOUBLE PRECISION,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                );
+                """
+                
+                try:
+                    supabase.table('fam_records').select('*').limit(1).execute()
+                    print("✅ Fam records table exists")
+                except:
+                    print("⚠️ Table may need to be created manually in Supabase dashboard")
+                    
+            except Exception as e:
+                print(f"⚠️ Supabase connection failed: {e}")
+                print("🔄 Falling back to local JSON storage")
+                USE_SUPABASE = False
         else:
-            print(f"❌ Supabase error: {response.status_code} - {response.text}")
-            return False
-            
-    except Exception as e:
-        print(f"❌ Supabase connection error: {e}")
-        return False
+            print("⚠️ Supabase credentials not found, using local JSON storage")
+            USE_SUPABASE = False
+    else:
+        print("⚠️ Supabase library not installed, using local JSON storage")
+        USE_SUPABASE = False
+    
+    # Initialize local storage
+    init_local_storage()
 
-def store_in_local_database(fam_data):
-    """Store data in local JSON and CSV databases"""
+def init_local_storage():
+    """Initialize local JSON storage"""
+    if not os.path.exists(DATA_FILE):
+        with open(DATA_FILE, 'w') as f:
+            json.dump([], f)
+        print(f"✅ Created local data file: {DATA_FILE}")
+
+def save_to_database(fam_data):
+    """Save FAM data to database"""
     try:
-        fam_id = fam_data.get('fam_id', '')
-        if not fam_id:
+        if not fam_data or not fam_data.get('fam_id'):
             return False
         
-        # Prepare record
+        fam_id = fam_data.get('fam_id')
+        
+        # Prepare data
         record = {
             'fam_id': fam_id,
             'name': fam_data.get('name', ''),
             'phone': fam_data.get('phone', ''),
             'type': fam_data.get('type', 'contact'),
-            'breached_timestamp': fam_data.get('breached_timestamp', time.time()),
-            'created_at': datetime.utcnow().isoformat()
+            'breached_timestamp': time.time(),
+            'updated_at': datetime.now().isoformat()
         }
         
-        # Store in JSON database
-        with open(JSON_DB_FILE, 'r+') as f:
-            data = json.load(f)
-            data[fam_id] = record
-            f.seek(0)
+        if USE_SUPABASE and supabase:
+            try:
+                # Check if record exists
+                existing = supabase.table('fam_records') \
+                    .select('*') \
+                    .eq('fam_id', fam_id) \
+                    .execute()
+                
+                if existing.data and len(existing.data) > 0:
+                    # Update existing record
+                    response = supabase.table('fam_records') \
+                        .update(record) \
+                        .eq('fam_id', fam_id) \
+                        .execute()
+                    print(f"✅ Updated existing record in Supabase: {fam_id}")
+                else:
+                    # Insert new record
+                    response = supabase.table('fam_records') \
+                        .insert(record) \
+                        .execute()
+                    print(f"✅ Inserted new record to Supabase: {fam_id}")
+                
+                return True
+                
+            except Exception as e:
+                print(f"❌ Supabase error: {e}")
+                # Fall back to local storage
+                USE_SUPABASE = False
+        
+        # Local JSON storage
+        return save_to_local_json(fam_data)
+        
+    except Exception as e:
+        print(f"❌ Database save error: {e}")
+        return False
+
+def save_to_local_json(fam_data):
+    """Save to local JSON file"""
+    try:
+        # Read existing data
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE, 'r') as f:
+                data = json.load(f)
+        else:
+            data = []
+        
+        # Check if exists
+        fam_id = fam_data.get('fam_id')
+        existing_index = -1
+        for i, record in enumerate(data):
+            if record.get('fam_id') == fam_id:
+                existing_index = i
+                break
+        
+        # Add timestamp
+        fam_data['breached_timestamp'] = time.time()
+        fam_data['updated_at'] = datetime.now().isoformat()
+        
+        if existing_index >= 0:
+            # Update
+            data[existing_index] = fam_data
+            print(f"✅ Updated local record: {fam_id}")
+        else:
+            # Add new
+            data.append(fam_data)
+            print(f"✅ Added new local record: {fam_id}")
+        
+        # Save
+        with open(DATA_FILE, 'w') as f:
             json.dump(data, f, indent=2)
-            f.truncate()
         
-        # Store in CSV database
-        with open(CSV_DB_FILE, 'a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                record['fam_id'],
-                record['name'],
-                record['phone'],
-                record['type'],
-                record['breached_timestamp'],
-                record['created_at']
-            ])
+        # Update CSV
+        update_csv(data)
         
-        print(f"✅ Stored locally: {fam_id}")
         return True
         
     except Exception as e:
-        print(f"❌ Local storage error: {e}")
+        print(f"❌ Local JSON save error: {e}")
         return False
 
-def store_in_database(fam_data):
-    """Store data in both local and cloud databases"""
-    # Always store locally
-    local_success = store_in_local_database(fam_data)
-    
-    # Store in Supabase if configured
-    cloud_success = False
-    if USE_DATABASE:
-        cloud_success = store_in_supabase(fam_data)
-    
-    return local_success or cloud_success
+def update_csv(data):
+    """Update CSV file from JSON data"""
+    try:
+        if not data:
+            return
+        
+        # Define CSV columns
+        fieldnames = ['fam_id', 'name', 'phone', 'type', 'breached_timestamp', 'updated_at']
+        
+        with open(CSV_FILE, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            
+            for record in data:
+                # Prepare row
+                row = {
+                    'fam_id': record.get('fam_id', ''),
+                    'name': record.get('name', ''),
+                    'phone': record.get('phone', ''),
+                    'type': record.get('type', 'contact'),
+                    'breached_timestamp': record.get('breached_timestamp', time.time()),
+                    'updated_at': record.get('updated_at', datetime.now().isoformat())
+                }
+                writer.writerow(row)
+        
+        print(f"📊 Updated CSV file: {CSV_FILE}")
+        
+    except Exception as e:
+        print(f"❌ CSV update error: {e}")
 
 def get_from_database(fam_id):
-    """Retrieve data from database"""
-    # First check local JSON database
+    """Get FAM data from database"""
     try:
-        with open(JSON_DB_FILE, 'r') as f:
-            data = json.load(f)
-            if fam_id in data:
-                print(f"📂 Found in database: {fam_id}")
-                return data[fam_id]
-    except:
-        pass
-    
-    return None
+        if USE_SUPABASE and supabase:
+            try:
+                response = supabase.table('fam_records') \
+                    .select('*') \
+                    .eq('fam_id', fam_id) \
+                    .execute()
+                
+                if response.data and len(response.data) > 0:
+                    print(f"✅ Found in Supabase: {fam_id}")
+                    return response.data[0]
+                    
+            except Exception as e:
+                print(f"❌ Supabase query error: {e}")
+        
+        # Fall back to local storage
+        return get_from_local_json(fam_id)
+        
+    except Exception as e:
+        print(f"❌ Database query error: {e}")
+        return None
 
-def should_store_in_database():
-    """Check if this is every 200th query"""
-    global query_counter
-    return query_counter % 200 == 0 and query_counter > 0
+def get_from_local_json(fam_id):
+    """Get from local JSON file"""
+    try:
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE, 'r') as f:
+                data = json.load(f)
+            
+            for record in data:
+                if record.get('fam_id') == fam_id:
+                    print(f"✅ Found in local JSON: {fam_id}")
+                    return record
+        
+        return None
+        
+    except Exception as e:
+        print(f"❌ Local JSON read error: {e}")
+        return None
 
-# ========== TELEGRAM FUNCTIONS ==========
 def get_telegram_client():
     """Get Telegram client - initialize only when needed"""
     global telegram_client
@@ -261,9 +329,6 @@ def extract_fam_info_from_text(text):
     if type_match:
         info['type'] = type_match.group(1).strip().lower()
     
-    # Add breached timestamp
-    info['breached_timestamp'] = time.time()
-    
     return info
 
 def download_txt_file(client, message):
@@ -279,12 +344,21 @@ def download_txt_file(client, message):
         # Download file
         client.download_media(message, file=temp_path)
         
-        # Read file
-        with open(temp_path, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
+        # Read with multiple encodings
+        encodings = ['utf-8', 'latin-1', 'iso-8859-1']
+        content = None
+        
+        for encoding in encodings:
+            try:
+                with open(temp_path, 'r', encoding=encoding) as f:
+                    content = f.read()
+                break
+            except:
+                continue
         
         # Clean up
-        os.remove(temp_path)
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
         
         return content
         
@@ -300,37 +374,48 @@ def get_fam_data_from_telegram(query):
         chat_id = -1003674153946
         
         # Send command
-        print(f"📤 Sending: /fam {query}")
-        sent_msg = client.send_message(chat_id, f"/fam {query}")
+        print(f"📤 Sending to Telegram: /fam {query}")
+        sent_message = client.send_message(chat_id, f"/fam {query}")
+        sent_id = sent_message.id
         
-        # Wait for response
-        time.sleep(12)
+        # Wait for bot response
+        print("⏳ Waiting for bot response...")
+        time.sleep(15)
         
         # Get messages
-        messages = client.get_messages(chat_id, limit=15)
+        messages = client.get_messages(chat_id, limit=20)
         
         for msg in messages:
-            if msg.id > sent_msg.id:
+            if msg.id > sent_id:
                 try:
                     sender = client.get_entity(msg.sender_id)
                     if hasattr(sender, 'bot') and sender.bot:
-                        # Check for file
+                        print(f"🤖 Found bot message: {msg.id}")
+                        
+                        # Check for .txt file
                         if msg.media:
+                            print("📁 Downloading .txt file...")
                             file_content = download_txt_file(client, msg)
+                            
                             if file_content and query.lower() in file_content.lower():
+                                print("✅ Found matching .txt file")
                                 fam_data = extract_fam_info_from_text(file_content)
-                                if fam_data.get('fam_id'):
+                                
+                                if fam_data and fam_data.get('fam_id'):
                                     return fam_data
                         
                         # Check message text
                         if msg.message and query.lower() in msg.message.lower():
+                            print("✅ Found matching message text")
                             fam_data = extract_fam_info_from_text(msg.message)
-                            if fam_data.get('fam_id'):
+                            
+                            if fam_data and fam_data.get('fam_id'):
                                 return fam_data
                                 
                 except Exception as e:
                     print(f"⚠️ Message processing error: {e}")
         
+        print("❌ No valid bot response found")
         return None
         
     except Exception as e:
@@ -341,58 +426,9 @@ def get_fam_data_from_telegram(query):
         # Keep connection alive
         pass
 
-# ========== MAIN API FUNCTION ==========
-def get_fam_info_with_storage(query):
-    """
-    Main function to get FAM info with database storage
-    """
-    # Increment query counter
-    query_number = increment_query_counter()
-    print(f"🔍 Query #{query_number} for: {query}")
-    
-    # First, check database
-    db_data = get_from_database(query)
-    if db_data:
-        print(f"📊 Returning from database")
-        return {
-            'success': True,
-            'data': db_data,
-            'source': 'database',
-            'query_number': query_number
-        }
-    
-    # If not in database, get from Telegram
-    print(f"📡 Fetching from Telegram...")
-    fam_data = get_fam_data_from_telegram(query)
-    
-    if fam_data and fam_data.get('fam_id'):
-        # Ensure fam_id is set
-        if not fam_data.get('fam_id'):
-            fam_data['fam_id'] = query
-        
-        # Store every 200th query
-        if should_store_in_database():
-            print(f"💾 Storing in database (query #{query_number} is 200th)")
-            store_in_database(fam_data)
-        
-        return {
-            'success': True,
-            'data': fam_data,
-            'source': 'telegram',
-            'query_number': query_number,
-            'stored_in_db': should_store_in_database()
-        }
-    
-    return {
-        'success': False,
-        'error': 'No data found',
-        'query_number': query_number
-    }
-
-# ========== FLASK ROUTES ==========
 @app.route('/api', methods=['GET'])
-def api_endpoint():
-    """Main API endpoint"""
+def get_fam_info():
+    """Main API endpoint - checks DB first, then Telegram"""
     query = request.args.get('fam', '').strip()
     
     if not query:
@@ -402,75 +438,80 @@ def api_endpoint():
             'example': '/api?fam=sugarsingh@fam'
         }), 400
     
+    print(f"\n" + "="*60)
+    print(f"🔍 Processing: {query}")
+    print("="*60)
+    
+    # Check database first
+    db_data = get_from_database(query)
+    
+    if db_data:
+        print(f"✅ Found in database")
+        return jsonify({
+            'success': True,
+            'query': query,
+            'source': 'database',
+            'data': {
+                'fam_id': db_data.get('fam_id', query),
+                'name': db_data.get('name', ''),
+                'phone': db_data.get('phone', ''),
+                'type': db_data.get('type', 'contact'),
+                'breached_timestamp': db_data.get('breached_timestamp', time.time()),
+                'updated_at': db_data.get('updated_at', datetime.now().isoformat())
+            }
+        })
+    
+    # If not in database, get from Telegram
+    print(f"🔄 Not in database, querying Telegram...")
+    
     try:
-        result = get_fam_info_with_storage(query)
+        fam_data = get_fam_data_from_telegram(query)
         
-        if result['success']:
-            response_data = {
+        if fam_data and (fam_data.get('fam_id') or fam_data.get('name') or fam_data.get('phone')):
+            # Ensure fam_id is set
+            if not fam_data.get('fam_id'):
+                fam_data['fam_id'] = query
+            
+            # Save to database
+            save_to_database(fam_data)
+            
+            return jsonify({
                 'success': True,
                 'query': query,
-                'data': result['data'],
-                'source': result['source'],
-                'query_number': result.get('query_number', 0)
-            }
-            
-            if result.get('stored_in_db'):
-                response_data['note'] = 'Stored in database (200th query)'
-            
-            return jsonify(response_data)
+                'source': 'telegram',
+                'data': {
+                    'fam_id': fam_data.get('fam_id', query),
+                    'name': fam_data.get('name', ''),
+                    'phone': fam_data.get('phone', ''),
+                    'type': fam_data.get('type', 'contact'),
+                    'breached_timestamp': time.time(),
+                    'updated_at': datetime.now().isoformat()
+                }
+            })
         else:
             return jsonify({
                 'success': False,
-                'error': result.get('error', 'Unknown error'),
-                'query': query,
-                'query_number': result.get('query_number', 0)
+                'error': 'No FAM information found',
+                'query': query
             }), 404
             
     except Exception as e:
-        print(f"💥 API Error: {e}")
         return jsonify({
             'success': False,
             'error': str(e),
             'query': query
         }), 500
 
-@app.route('/database/stats', methods=['GET'])
-def database_stats():
-    """Get database statistics"""
-    try:
-        # Load JSON database
-        with open(JSON_DB_FILE, 'r') as f:
-            json_data = json.load(f)
-        
-        # Count CSV records
-        csv_count = 0
-        if os.path.exists(CSV_DB_FILE):
-            with open(CSV_DB_FILE, 'r') as f:
-                csv_count = sum(1 for _ in f) - 1  # Subtract header
-        
-        return jsonify({
-            'success': True,
-            'json_records': len(json_data),
-            'csv_records': max(0, csv_count),
-            'query_counter': query_counter,
-            'next_storage_at': (200 - (query_counter % 200)) if query_counter > 0 else 200,
-            'database_enabled': USE_DATABASE,
-            'sample_record': list(json_data.values())[0] if json_data else None
-        })
-        
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/database/search/<fam_id>', methods=['GET'])
-def database_search(fam_id):
-    """Search in database"""
-    data = get_from_database(fam_id)
+@app.route('/api/search/<fam_id>', methods=['GET'])
+def search_fam(fam_id):
+    """Search for specific FAM ID in database"""
+    db_data = get_from_database(fam_id)
     
-    if data:
+    if db_data:
         return jsonify({
             'success': True,
             'found': True,
-            'data': data
+            'data': db_data
         })
     else:
         return jsonify({
@@ -479,101 +520,194 @@ def database_search(fam_id):
             'message': f'FAM ID {fam_id} not found in database'
         })
 
-@app.route('/database/export/json', methods=['GET'])
-def export_json():
-    """Export JSON database"""
+@app.route('/api/stats', methods=['GET'])
+def get_stats():
+    """Get database statistics"""
     try:
-        with open(JSON_DB_FILE, 'r') as f:
-            data = json.load(f)
+        total_records = 0
         
-        response = jsonify(data)
-        response.headers['Content-Disposition'] = 'attachment; filename=fam_database.json'
-        return response
+        if USE_SUPABASE and supabase:
+            try:
+                response = supabase.table('fam_records') \
+                    .select('*', count='exact') \
+                    .execute()
+                total_records = response.count or 0
+            except:
+                pass
+        
+        # Count local records
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE, 'r') as f:
+                data = json.load(f)
+            local_records = len(data)
+        else:
+            local_records = 0
+        
+        return jsonify({
+            'success': True,
+            'database_type': 'supabase' if USE_SUPABASE else 'local_json',
+            'total_records': total_records or local_records,
+            'local_records': local_records,
+            'csv_available': os.path.exists(CSV_FILE),
+            'files': {
+                'json': DATA_FILE if os.path.exists(DATA_FILE) else None,
+                'csv': CSV_FILE if os.path.exists(CSV_FILE) else None
+            }
+        })
         
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
-@app.route('/database/export/csv', methods=['GET'])
-def export_csv():
-    """Export CSV database"""
+@app.route('/api/export/json', methods=['GET'])
+def export_json():
+    """Export all data as JSON"""
     try:
-        with open(CSV_DB_FILE, 'r') as f:
-            csv_content = f.read()
-        
-        response = app.response_class(
-            csv_content,
-            mimetype='text/csv',
-            headers={'Content-Disposition': 'attachment; filename=fam_database.csv'}
-        )
-        return response
-        
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE, 'r') as f:
+                data = json.load(f)
+            
+            return jsonify({
+                'success': True,
+                'count': len(data),
+                'data': data,
+                'timestamp': time.time()
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'No data available'
+            }), 404
+            
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/export/csv', methods=['GET'])
+def export_csv():
+    """Export all data as CSV download"""
+    try:
+        if os.path.exists(CSV_FILE):
+            with open(CSV_FILE, 'r', encoding='utf-8') as f:
+                csv_content = f.read()
+            
+            # Create download response
+            output = io.StringIO()
+            output.write(csv_content)
+            
+            return app.response_class(
+                output.getvalue(),
+                mimetype='text/csv',
+                headers={'Content-Disposition': f'attachment;filename=fam_data_{int(time.time())}.csv'}
+            )
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'CSV file not available'
+            }), 404
+            
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/refresh/<fam_id>', methods=['GET'])
+def refresh_fam(fam_id):
+    """Force refresh data for a FAM ID from Telegram"""
+    try:
+        print(f"🔄 Force refreshing: {fam_id}")
+        
+        fam_data = get_fam_data_from_telegram(fam_id)
+        
+        if fam_data and (fam_data.get('fam_id') or fam_data.get('name') or fam_data.get('phone')):
+            if not fam_data.get('fam_id'):
+                fam_data['fam_id'] = fam_id
+            
+            # Update database
+            save_to_database(fam_data)
+            
+            return jsonify({
+                'success': True,
+                'message': f'Refreshed data for {fam_id}',
+                'data': {
+                    'fam_id': fam_data.get('fam_id', fam_id),
+                    'name': fam_data.get('name', ''),
+                    'phone': fam_data.get('phone', ''),
+                    'type': fam_data.get('type', 'contact'),
+                    'breached_timestamp': time.time(),
+                    'updated_at': datetime.now().isoformat()
+                }
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': f'Could not refresh data for {fam_id}'
+            }), 404
+            
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
 @app.route('/health', methods=['GET'])
 def health():
     """Health check"""
+    db_status = 'supabase' if USE_SUPABASE else 'local_json'
+    
     return jsonify({
         'status': 'healthy',
         'service': 'FAM API with Database',
-        'query_counter': query_counter,
-        'database_enabled': USE_DATABASE,
-        'database_size': len(get_from_database('dummy') or {}),
-        'timestamp': time.time()
+        'database': db_status,
+        'timestamp': time.time(),
+        'endpoints': [
+            '/api?fam=upi@fam',
+            '/api/search/fam_id',
+            '/api/stats',
+            '/api/export/json',
+            '/api/export/csv',
+            '/api/refresh/fam_id'
+        ]
     })
 
 @app.route('/')
 def home():
     """Home page"""
     return jsonify({
-        'service': 'FAM API with Database Storage',
-        'description': 'Stores every 200th query in database for future use',
+        'service': 'FAM API with Cloud Database',
+        'description': 'Stores all queries in database (Supabase cloud or local JSON)',
         'features': [
-            'No cache system - always checks database first',
-            'Stores every 200th query in JSON and CSV databases',
-            'Uses Supabase cloud storage (if configured)',
-            'Indexed by fam_id for fast lookup'
+            'Database-first: Checks DB before querying Telegram',
+            'Auto-save: All successful queries saved to database',
+            'Dual format: JSON and CSV exports',
+            'Free cloud: Uses Supabase free tier',
+            'Local fallback: JSON storage if cloud unavailable'
         ],
         'usage': 'GET /api?fam=upi@fam',
-        'example': '/api?fam=sugarsingh@fam',
         'database_endpoints': {
-            '/database/stats': 'Database statistics',
-            '/database/search/{fam_id}': 'Search in database',
-            '/database/export/json': 'Export JSON database',
-            '/database/export/csv': 'Export CSV database'
+            '/api/search/<fam_id>': 'Search in database',
+            '/api/stats': 'Database statistics',
+            '/api/export/json': 'Export all data as JSON',
+            '/api/export/csv': 'Download all data as CSV',
+            '/api/refresh/<fam_id>': 'Force refresh from Telegram'
         }
     })
 
-# ========== INITIALIZATION ==========
-def init_app():
-    """Initialize application"""
-    # Create local database files
-    init_local_database()
-    
-    # Load query counter
-    load_query_counter()
-    
-    print(f"🚀 FAM API with Database initialized")
-    print(f"📊 Query counter: {query_counter}")
-    print(f"💾 Next storage at query: {200 - (query_counter % 200)} more queries")
-    print(f"☁️  Supabase enabled: {USE_DATABASE}")
-    
-    # Try to initialize Telegram client
-    try:
-        get_telegram_client()
-        print("✅ Telegram client pre-initialized")
-    except Exception as e:
-        print(f"⚠️ Telegram initialization deferred: {e}")
+# Initialize on startup
+init_database()
 
-# Initialize on import
-init_app()
-
-# Cleanup on exit
+# Close connection on shutdown
 import atexit
 atexit.register(close_telegram_client)
-atexit.register(save_query_counter)
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 10000))
-    print(f"🌐 Starting on port {port}")
+    print(f"🚀 Starting FAM API with Database on port {port}")
+    print(f"💾 Database: {'Supabase' if USE_SUPABASE else 'Local JSON'}")
+    
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
