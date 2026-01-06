@@ -2,205 +2,46 @@ import os
 import re
 import time
 import json
-import tempfile
-import threading
-import concurrent.futures
 import csv
 import io
 from datetime import datetime
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
-# Initialize Flask
-app = Flask(__name__)
-
-# Load environment variables
 load_dotenv()
 
-# Global variables
-telegram_client = None
-client_lock = threading.Lock()
-executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+app = Flask(__name__)
 
-# Supabase configuration
-SUPABASE_AVAILABLE = False
-supabase = None
-USE_LOCAL_STORAGE = True  # Default to local storage
-
-# Local storage files
+# Storage files
 DATA_FILE = "fam_data.json"
 CSV_FILE = "fam_data.csv"
 
 # Initialize storage
 def init_storage():
-    """Initialize storage system"""
-    global SUPABASE_AVAILABLE, supabase, USE_LOCAL_STORAGE
-    
-    # Try to initialize Supabase
-    try:
-        from supabase import create_client
-        
-        supabase_url = os.getenv('SUPABASE_URL')
-        supabase_key = os.getenv('SUPABASE_KEY')
-        
-        if supabase_url and supabase_key:
-            supabase = create_client(supabase_url, supabase_key)
-            
-            # Test connection and create table if needed
-            try:
-                # Try to create table
-                create_table_sql = """
-                CREATE TABLE IF NOT EXISTS fam_records (
-                    id BIGSERIAL PRIMARY KEY,
-                    fam_id VARCHAR(255) UNIQUE NOT NULL,
-                    name TEXT,
-                    phone VARCHAR(20),
-                    type VARCHAR(50) DEFAULT 'contact',
-                    breached_timestamp DOUBLE PRECISION,
-                    created_at TIMESTAMPTZ DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ DEFAULT NOW()
-                );
-                """
-                
-                # Execute via REST API (limited) - we'll handle locally for now
-                print("✅ Supabase connected")
-                SUPABASE_AVAILABLE = True
-                USE_LOCAL_STORAGE = False
-                
-            except Exception as e:
-                print(f"⚠️ Supabase table issue: {e}")
-                print("🔄 Using local storage")
-                USE_LOCAL_STORAGE = True
-        else:
-            print("⚠️ Supabase credentials missing")
-            USE_LOCAL_STORAGE = True
-            
-    except ImportError:
-        print("⚠️ Supabase library not installed")
-        USE_LOCAL_STORAGE = True
-    except Exception as e:
-        print(f"⚠️ Supabase init error: {e}")
-        USE_LOCAL_STORAGE = True
-    
-    # Initialize local storage
-    if USE_LOCAL_STORAGE or not SUPABASE_AVAILABLE:
-        init_local_storage()
-
-def init_local_storage():
-    """Initialize local JSON storage"""
+    """Initialize local storage"""
     try:
         if not os.path.exists(DATA_FILE):
             with open(DATA_FILE, 'w') as f:
                 json.dump([], f)
             print(f"✅ Created local data file: {DATA_FILE}")
     except Exception as e:
-        print(f"❌ Local storage init error: {e}")
+        print(f"❌ Storage init error: {e}")
 
-# Telegram client
-def get_telegram_client():
-    """Get or create Telegram client"""
-    global telegram_client
-    
-    with client_lock:
-        if telegram_client is None:
-            try:
-                from telethon.sync import TelegramClient
-                from telethon.sessions import StringSession
-                
-                api_id = int(os.getenv('TELEGRAM_API_ID', 0))
-                api_hash = os.getenv('TELEGRAM_API_HASH', '')
-                session_string = os.getenv('TELEGRAM_SESSION_STRING', '')
-                
-                if not all([api_id, api_hash, session_string]):
-                    raise ValueError("Missing Telegram credentials")
-                
-                telegram_client = TelegramClient(
-                    StringSession(session_string),
-                    api_id,
-                    api_hash
-                )
-                telegram_client.start()
-                print(f"✅ Telegram client connected")
-                
-            except Exception as e:
-                print(f"❌ Telegram client error: {e}")
-                raise
-    
-    return telegram_client
-
-def close_telegram_client():
-    """Close Telegram client"""
-    global telegram_client
-    with client_lock:
-        if telegram_client and telegram_client.is_connected():
-            telegram_client.disconnect()
-            telegram_client = None
-            print("✅ Telegram client disconnected")
+init_storage()
 
 # Database operations
 def save_to_database(fam_data):
-    """Save data to database (Supabase or local)"""
+    """Save data to local JSON and CSV"""
     try:
         if not fam_data or not fam_data.get('fam_id'):
             return False
         
         fam_id = fam_data.get('fam_id')
         
-        # Prepare record
-        record = {
-            'fam_id': fam_id,
-            'name': fam_data.get('name', ''),
-            'phone': fam_data.get('phone', ''),
-            'type': fam_data.get('type', 'contact'),
-            'breached_timestamp': time.time(),
-            'updated_at': datetime.now().isoformat()
-        }
-        
-        # Try Supabase first if available
-        if SUPABASE_AVAILABLE and supabase and not USE_LOCAL_STORAGE:
-            try:
-                # Check if exists
-                existing = supabase.table('fam_records') \
-                    .select('*') \
-                    .eq('fam_id', fam_id) \
-                    .execute()
-                
-                if existing.data:
-                    # Update
-                    supabase.table('fam_records') \
-                        .update(record) \
-                        .eq('fam_id', fam_id) \
-                        .execute()
-                    print(f"✅ Updated in Supabase: {fam_id}")
-                else:
-                    # Insert
-                    supabase.table('fam_records') \
-                        .insert(record) \
-                        .execute()
-                    print(f"✅ Inserted to Supabase: {fam_id}")
-                
-                return True
-                
-            except Exception as e:
-                print(f"❌ Supabase error: {e}")
-                # Fallback to local
-                return save_to_local(fam_data)
-        
-        # Local storage
-        return save_to_local(fam_data)
-        
-    except Exception as e:
-        print(f"❌ Database save error: {e}")
-        return False
-
-def save_to_local(fam_data):
-    """Save to local JSON and CSV"""
-    try:
-        fam_id = fam_data.get('fam_id')
-        
-        # Add timestamp
+        # Add timestamps
         fam_data['breached_timestamp'] = time.time()
         fam_data['updated_at'] = datetime.now().isoformat()
+        fam_data['created_at'] = fam_data.get('created_at', datetime.now().isoformat())
         
         # Load existing data
         if os.path.exists(DATA_FILE):
@@ -227,11 +68,11 @@ def save_to_local(fam_data):
         # Update CSV
         update_csv(data)
         
-        print(f"✅ Saved locally: {fam_id}")
+        print(f"✅ Saved to database: {fam_id}")
         return True
         
     except Exception as e:
-        print(f"❌ Local save error: {e}")
+        print(f"❌ Database save error: {e}")
         return False
 
 def update_csv(data):
@@ -240,7 +81,7 @@ def update_csv(data):
         if not data:
             return
         
-        fieldnames = ['fam_id', 'name', 'phone', 'type', 'breached_timestamp', 'updated_at']
+        fieldnames = ['fam_id', 'name', 'phone', 'type', 'breached_timestamp', 'created_at', 'updated_at']
         
         with open(CSV_FILE, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -253,6 +94,7 @@ def update_csv(data):
                     'phone': record.get('phone', ''),
                     'type': record.get('type', 'contact'),
                     'breached_timestamp': record.get('breached_timestamp', time.time()),
+                    'created_at': record.get('created_at', datetime.now().isoformat()),
                     'updated_at': record.get('updated_at', datetime.now().isoformat())
                 }
                 writer.writerow(row)
@@ -265,169 +107,229 @@ def update_csv(data):
 def get_from_database(fam_id):
     """Get data from database"""
     try:
-        # Try Supabase first
-        if SUPABASE_AVAILABLE and supabase and not USE_LOCAL_STORAGE:
-            try:
-                response = supabase.table('fam_records') \
-                    .select('*') \
-                    .eq('fam_id', fam_id) \
-                    .execute()
-                
-                if response.data:
-                    return response.data[0]
-                    
-            except Exception as e:
-                print(f"❌ Supabase query error: {e}")
+        if not os.path.exists(DATA_FILE):
+            return None
         
-        # Fallback to local
-        return get_from_local(fam_id)
+        with open(DATA_FILE, 'r') as f:
+            data = json.load(f)
+        
+        for record in data:
+            if record.get('fam_id') == fam_id:
+                return record
+        
+        return None
         
     except Exception as e:
         print(f"❌ Database query error: {e}")
         return None
 
-def get_from_local(fam_id):
-    """Get from local JSON"""
+def get_all_records():
+    """Get all records from database"""
     try:
-        if os.path.exists(DATA_FILE):
-            with open(DATA_FILE, 'r') as f:
-                data = json.load(f)
-            
-            for record in data:
-                if record.get('fam_id') == fam_id:
-                    return record
+        if not os.path.exists(DATA_FILE):
+            return []
         
-        return None
+        with open(DATA_FILE, 'r') as f:
+            return json.load(f)
         
     except Exception as e:
-        print(f"❌ Local query error: {e}")
-        return None
+        print(f"❌ Get all records error: {e}")
+        return []
 
-# Telegram operations
+# FAM info extraction
 def extract_fam_info(text):
-    """Extract FAM info from text"""
+    """Extract FAM information from text"""
     info = {}
     
     if not text:
         return info
     
-    # FAM ID
-    patterns = [
+    # Clean the text
+    text = text.strip()
+    
+    # Debug: Show first 500 chars
+    print(f"📝 Parsing text (first 500 chars): {text[:500]}")
+    
+    # FAM ID patterns
+    fam_patterns = [
         r'FAM ID\s*[:=]\s*([^\n\r]+)',
         r'FAM\s*[:=]\s*([^\n\r]+)',
-        r'ID\s*[:=]\s*([^\n\r]+)'
+        r'ID\s*[:=]\s*([^\n\r]+)',
+        r'FAM\s+ID\s*[:=]\s*([^\n\r]+)'
     ]
     
-    for pattern in patterns:
+    for pattern in fam_patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
             info['fam_id'] = match.group(1).strip()
+            print(f"✅ Found FAM ID: {info['fam_id']}")
             break
     
     # NAME
     name_match = re.search(r'NAME\s*[:=]\s*([^\n\r]+)', text, re.IGNORECASE)
     if name_match:
         info['name'] = name_match.group(1).strip()
+        print(f"✅ Found NAME: {info['name']}")
     
     # PHONE
     phone_match = re.search(r'PHONE\s*[:=]\s*([^\n\r]+)', text, re.IGNORECASE)
     if phone_match:
-        info['phone'] = phone_match.group(1).strip()
+        info['phone'] = match.group(1).strip()
+        print(f"✅ Found PHONE: {info['phone']}")
     
     # TYPE
     type_match = re.search(r'TYPE\s*[:=]\s*([^\n\r]+)', text, re.IGNORECASE)
     if type_match:
         info['type'] = match.group(1).strip().lower()
+        print(f"✅ Found TYPE: {info['type']}")
+    
+    # If no patterns matched, try line-by-line
+    if not info:
+        lines = text.split('\n')
+        for line in lines:
+            line = line.strip()
+            if ':' in line:
+                key, value = line.split(':', 1)
+                key = key.strip().lower()
+                value = value.strip()
+                
+                if 'fam' in key and 'id' in key:
+                    info['fam_id'] = value
+                elif 'name' in key:
+                    info['name'] = value
+                elif 'phone' in key:
+                    info['phone'] = value
+                elif 'type' in key:
+                    info['type'] = value
     
     return info
 
-def download_file(client, message):
-    """Download file from message"""
-    try:
-        if not message.media:
-            return None
+# Telegram operations (SYNCHRONOUS)
+class TelegramBot:
+    """Synchronous Telegram bot client"""
+    
+    def __init__(self):
+        self.client = None
+        self.connected = False
+    
+    def connect(self):
+        """Connect to Telegram synchronously"""
+        try:
+            # Import inside function to handle missing dependencies
+            from telethon.sync import TelegramClient
+            from telethon.sessions import StringSession
+            
+            api_id = int(os.getenv('TELEGRAM_API_ID', 0))
+            api_hash = os.getenv('TELEGRAM_API_HASH', '')
+            session_string = os.getenv('TELEGRAM_SESSION_STRING', '')
+            
+            if not all([api_id, api_hash, session_string]):
+                raise ValueError("Missing Telegram credentials")
+            
+            self.client = TelegramClient(
+                StringSession(session_string),
+                api_id,
+                api_hash
+            )
+            
+            # Connect synchronously
+            self.client.start()
+            self.connected = True
+            print(f"✅ Telegram client connected")
+            
+            return True
+            
+        except ImportError:
+            print("❌ Telethon not installed. Install with: pip install telethon")
+            return False
+        except Exception as e:
+            print(f"❌ Telegram connection error: {e}")
+            return False
+    
+    def query_fam(self, fam_query):
+        """Query FAM information from bot"""
+        if not self.connected and not self.connect():
+            return {'error': 'Telegram not connected'}
         
-        with tempfile.NamedTemporaryFile(mode='w+b', delete=False, suffix='.txt') as tmp:
-            temp_path = tmp.name
-        
-        # Download
-        result = client.download_media(message, file=temp_path)
-        file_path = result or temp_path
-        
-        # Read with multiple encodings
-        for encoding in ['utf-8', 'latin-1', 'cp1252']:
-            try:
-                with open(file_path, 'r', encoding=encoding) as f:
-                    content = f.read()
-                
-                # Clean up
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-                
-                return content
-            except:
-                continue
-        
-        # If all encodings fail
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        
-        return None
-        
-    except Exception as e:
-        print(f"❌ File download error: {e}")
-        return None
-
-def query_telegram_async(query):
-    """Query Telegram asynchronously"""
-    try:
-        client = get_telegram_client()
-        chat_id = -1003674153946
-        
-        # Validate query ends with @fam
-        if not query.endswith('@fam'):
-            return {'error': 'Query must end with @fam'}
-        
-        # Send command
-        command = f"/fam {query}"
-        sent_msg = client.send_message(chat_id, command)
-        sent_id = sent_msg.id
-        
-        # Wait for response
-        time.sleep(10)
-        
-        # Get messages
-        messages = client.get_messages(chat_id, limit=20)
-        
-        for msg in messages:
-            if msg.id > sent_id:
-                try:
-                    sender = client.get_entity(msg.sender_id)
-                    if not (hasattr(sender, 'bot') and sender.bot):
-                        continue
-                    
-                    # Check if this is for our query
-                    msg_text = msg.message or ""
-                    
-                    # Option 1: Check file
-                    if msg.media:
-                        file_content = download_file(client, msg)
-                        if file_content and query.lower() in file_content.lower():
-                            return extract_fam_info(file_content)
-                    
-                    # Option 2: Check message text
-                    if msg_text and query.lower() in msg_text.lower():
-                        return extract_fam_info(msg_text)
+        try:
+            chat_id = -1003674153946
+            
+            # Send command
+            print(f"📤 Sending to Telegram: /fam {fam_query}")
+            sent_message = self.client.send_message(chat_id, f"/fam {fam_query}")
+            sent_id = sent_message.id
+            
+            # Wait for bot response
+            print("⏳ Waiting 15 seconds for bot response...")
+            time.sleep(15)
+            
+            # Get recent messages
+            messages = self.client.get_messages(chat_id, limit=20)
+            
+            for msg in messages:
+                if msg.id > sent_id:
+                    try:
+                        # Check if from bot
+                        sender = self.client.get_entity(msg.sender_id)
+                        if not (hasattr(sender, 'bot') and sender.bot):
+                            continue
                         
-                except Exception as e:
-                    print(f"⚠️ Message processing error: {e}")
-                    continue
-        
-        return None
-        
-    except Exception as e:
-        print(f"❌ Telegram query error: {e}")
-        return {'error': str(e)}
+                        print(f"🤖 Found bot message ID: {msg.id}")
+                        
+                        # Try to get text from message or file
+                        text_content = ""
+                        
+                        # Check message text
+                        if msg.message:
+                            text_content = msg.message
+                            print(f"📝 Message text: {text_content[:100]}...")
+                        
+                        # Check for file attachment
+                        elif msg.media:
+                            print("📁 Downloading file...")
+                            try:
+                                # Create temp file
+                                import tempfile
+                                with tempfile.NamedTemporaryFile(mode='w+b', delete=False, suffix='.txt') as tmp:
+                                    temp_path = tmp.name
+                                
+                                # Download file
+                                self.client.download_media(msg, file=temp_path)
+                                
+                                # Read file
+                                for encoding in ['utf-8', 'latin-1', 'cp1252']:
+                                    try:
+                                        with open(temp_path, 'r', encoding=encoding) as f:
+                                            text_content = f.read()
+                                        break
+                                    except:
+                                        continue
+                                
+                                # Clean up
+                                if os.path.exists(temp_path):
+                                    os.remove(temp_path)
+                                    
+                            except Exception as file_error:
+                                print(f"❌ File download error: {file_error}")
+                        
+                        # Check if this is for our query
+                        if text_content and fam_query.lower() in text_content.lower():
+                            print(f"✅ Found response for: {fam_query}")
+                            return extract_fam_info(text_content)
+                            
+                    except Exception as e:
+                        print(f"⚠️ Message processing error: {e}")
+                        continue
+            
+            print("❌ No valid bot response found")
+            return None
+            
+        except Exception as e:
+            print(f"❌ Telegram query error: {e}")
+            return {'error': str(e)}
+
+# Initialize Telegram bot
+telegram_bot = TelegramBot()
 
 # API Endpoints
 @app.route('/api', methods=['GET'])
@@ -469,6 +371,7 @@ def get_fam_info():
                 'phone': db_data.get('phone', ''),
                 'type': db_data.get('type', 'contact'),
                 'breached_timestamp': db_data.get('breached_timestamp', time.time()),
+                'created_at': db_data.get('created_at', datetime.now().isoformat()),
                 'updated_at': db_data.get('updated_at', datetime.now().isoformat())
             }
         })
@@ -477,24 +380,22 @@ def get_fam_info():
     print(f"🔄 Querying Telegram...")
     
     try:
-        # Use thread pool for parallel processing
-        future = executor.submit(query_telegram_async, query)
-        fam_data = future.result(timeout=40)
+        fam_data = telegram_bot.query_fam(query)
         
         if isinstance(fam_data, dict) and 'error' in fam_data:
             return jsonify({
                 'success': False,
                 'error': fam_data['error'],
                 'query': query
-            }), 400
+            }), 500
         
         if fam_data and (fam_data.get('fam_id') or fam_data.get('name') or fam_data.get('phone')):
             # Ensure fam_id is set
             if not fam_data.get('fam_id'):
                 fam_data['fam_id'] = query
             
-            # Save to database in background
-            executor.submit(save_to_database, fam_data)
+            # Save to database
+            save_to_database(fam_data)
             
             return jsonify({
                 'success': True,
@@ -506,6 +407,7 @@ def get_fam_info():
                     'phone': fam_data.get('phone', ''),
                     'type': fam_data.get('type', 'contact'),
                     'breached_timestamp': time.time(),
+                    'created_at': datetime.now().isoformat(),
                     'updated_at': datetime.now().isoformat()
                 }
             })
@@ -516,12 +418,6 @@ def get_fam_info():
                 'query': query
             }), 404
             
-    except concurrent.futures.TimeoutError:
-        return jsonify({
-            'success': False,
-            'error': 'Telegram query timeout',
-            'query': query
-        }), 504
     except Exception as e:
         return jsonify({
             'success': False,
@@ -534,62 +430,18 @@ def get_fam_info():
 def db_stats():
     """Get database statistics"""
     try:
+        data = get_all_records()
+        
         stats = {
-            'storage': 'local_json' if USE_LOCAL_STORAGE else 'supabase',
-            'local_file': DATA_FILE if os.path.exists(DATA_FILE) else None,
-            'csv_file': CSV_FILE if os.path.exists(CSV_FILE) else None
+            'record_count': len(data),
+            'storage_type': 'local_json',
+            'data_file': DATA_FILE,
+            'csv_file': CSV_FILE,
+            'recent_records': [r.get('fam_id') for r in data[-10:]] if data else [],
+            'timestamp': time.time()
         }
         
-        if USE_LOCAL_STORAGE and os.path.exists(DATA_FILE):
-            with open(DATA_FILE, 'r') as f:
-                data = json.load(f)
-            stats['record_count'] = len(data)
-            stats['recent_records'] = [r.get('fam_id') for r in data[-5:]]
-        
         return jsonify({'success': True, 'stats': stats})
-        
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/db/export/json', methods=['GET'])
-def export_json():
-    """Export JSON data"""
-    try:
-        if not os.path.exists(DATA_FILE):
-            return jsonify({'success': False, 'error': 'No data available'}), 404
-        
-        with open(DATA_FILE, 'r') as f:
-            data = json.load(f)
-        
-        return jsonify({
-            'success': True,
-            'count': len(data),
-            'data': data,
-            'timestamp': time.time()
-        })
-        
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/db/export/csv', methods=['GET'])
-def export_csv():
-    """Export CSV data"""
-    try:
-        if not os.path.exists(CSV_FILE):
-            return jsonify({'success': False, 'error': 'No CSV data available'}), 404
-        
-        with open(CSV_FILE, 'r', encoding='utf-8') as f:
-            csv_content = f.read()
-        
-        # Create download response
-        output = io.StringIO()
-        output.write(csv_content)
-        
-        return app.response_class(
-            output.getvalue(),
-            mimetype='text/csv',
-            headers={'Content-Disposition': f'attachment;filename=fam_data_{int(time.time())}.csv'}
-        )
         
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -605,7 +457,11 @@ def search_fam(fam_id):
     if data:
         return jsonify({'success': True, 'found': True, 'data': data})
     else:
-        return jsonify({'success': True, 'found': False, 'message': f'FAM ID {fam_id} not found'})
+        return jsonify({
+            'success': True, 
+            'found': False, 
+            'message': f'FAM ID {fam_id} not found in database'
+        })
 
 @app.route('/api/db/refresh/<fam_id>', methods=['GET'])
 def refresh_fam(fam_id):
@@ -613,14 +469,13 @@ def refresh_fam(fam_id):
     if not fam_id.endswith('@fam'):
         return jsonify({'success': False, 'error': 'FAM ID must end with @fam'}), 400
     
-    print(f"🔄 Force refreshing: {fam_id}")
+    print(f"\n🔄 Force refreshing: {fam_id}")
     
     try:
-        # Query Telegram
-        fam_data = query_telegram_async(fam_id)
+        fam_data = telegram_bot.query_fam(fam_id)
         
         if isinstance(fam_data, dict) and 'error' in fam_data:
-            return jsonify({'success': False, 'error': fam_data['error']}), 400
+            return jsonify({'success': False, 'error': fam_data['error']}), 500
         
         if fam_data and (fam_data.get('fam_id') or fam_data.get('name') or fam_data.get('phone')):
             if not fam_data.get('fam_id'):
@@ -638,6 +493,7 @@ def refresh_fam(fam_id):
                     'phone': fam_data.get('phone', ''),
                     'type': fam_data.get('type', 'contact'),
                     'breached_timestamp': time.time(),
+                    'created_at': datetime.now().isoformat(),
                     'updated_at': datetime.now().isoformat()
                 }
             })
@@ -647,58 +503,143 @@ def refresh_fam(fam_id):
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
+@app.route('/api/db/export/json', methods=['GET'])
+def export_json():
+    """Export JSON data"""
+    try:
+        data = get_all_records()
+        
+        if not data:
+            return jsonify({'success': False, 'error': 'No data available'}), 404
+        
+        return jsonify({
+            'success': True,
+            'count': len(data),
+            'data': data,
+            'timestamp': time.time()
+        })
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/db/export/csv', methods=['GET'])
+def export_csv():
+    """Export CSV data"""
+    try:
+        if not os.path.exists(CSV_FILE):
+            # Generate CSV if doesn't exist
+            data = get_all_records()
+            if not data:
+                return jsonify({'success': False, 'error': 'No data available'}), 404
+            update_csv(data)
+        
+        with open(CSV_FILE, 'r', encoding='utf-8') as f:
+            csv_content = f.read()
+        
+        # Create download response
+        return app.response_class(
+            csv_content,
+            mimetype='text/csv',
+            headers={'Content-Disposition': f'attachment;filename=fam_data_{int(time.time())}.csv'}
+        )
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/db/clear', methods=['POST'])
+def clear_database():
+    """Clear all data (DANGEROUS - for testing only)"""
+    try:
+        with open(DATA_FILE, 'w') as f:
+            json.dump([], f)
+        
+        if os.path.exists(CSV_FILE):
+            os.remove(CSV_FILE)
+        
+        return jsonify({
+            'success': True,
+            'message': 'Database cleared',
+            'timestamp': time.time()
+        })
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 # Health and info endpoints
 @app.route('/health', methods=['GET'])
 def health():
     """Health check"""
+    telegram_status = 'connected' if telegram_bot.connected else 'disconnected'
+    
     return jsonify({
         'status': 'healthy',
         'service': 'FAM API',
-        'storage': 'local_json' if USE_LOCAL_STORAGE else 'supabase',
-        'telegram': 'connected' if telegram_client else 'disconnected',
-        'timestamp': time.time()
+        'storage': 'local_json',
+        'telegram': telegram_status,
+        'timestamp': time.time(),
+        'database_file': DATA_FILE,
+        'records_count': len(get_all_records())
     })
+
+@app.route('/test/telegram', methods=['GET'])
+def test_telegram():
+    """Test Telegram connection"""
+    try:
+        if telegram_bot.connect():
+            me = telegram_bot.client.get_me()
+            return jsonify({
+                'success': True,
+                'telegram': {
+                    'connected': True,
+                    'user': {
+                        'id': me.id,
+                        'first_name': me.first_name,
+                        'username': me.username
+                    }
+                }
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'Could not connect to Telegram'
+            }), 500
+            
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/', methods=['GET'])
 def home():
     """Home page"""
     return jsonify({
-        'service': 'FAM API with Database',
-        'description': 'High-performance API with database storage',
+        'service': 'FAM API',
+        'description': 'Synchronous Telegram FAM API with local database',
         'features': [
-            'Validates @fam suffix requirement',
-            'Database-first architecture',
-            'Parallel processing for speed',
-            'Automatic data persistence',
-            'JSON and CSV exports'
+            '100% synchronous - no async/threading issues',
+            '@fam suffix validation',
+            'Local JSON + CSV database',
+            'Fast repeat queries from database',
+            'Automatic data persistence'
         ],
         'usage': 'GET /api?fam=username@fam',
-        'validation': 'Query must end with @fam (e.g., sugarsingh@fam)',
+        'validation': 'Query MUST end with @fam',
         'endpoints': {
             '/api?fam=USERNAME@fam': 'Get FAM information',
-            '/api/db/search/USERNAME@fam': 'Search in database',
+            '/api/db/search/USERNAME@fam': 'Search database',
             '/api/db/stats': 'Database statistics',
             '/api/db/export/json': 'Export JSON',
-            '/api/db/export/csv': 'Export CSV',
+            '/api/db/export/csv': 'Download CSV',
             '/api/db/refresh/USERNAME@fam': 'Force refresh',
-            '/health': 'Health check'
+            '/health': 'Health check',
+            '/test/telegram': 'Test Telegram connection'
         },
         'example': 'https://your-app.onrender.com/api?fam=sugarsingh@fam'
     })
 
-# Initialize on startup
-init_storage()
-
-# Cleanup on shutdown
-import atexit
-atexit.register(close_telegram_client)
-atexit.register(executor.shutdown)
-
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 10000))
-    print(f"🚀 Starting optimized FAM API on port {port}")
-    print(f"💾 Storage: {'Local JSON' if USE_LOCAL_STORAGE else 'Supabase'}")
-    print(f"⚡ Threads: 3 parallel workers")
+    print(f"🚀 Starting FAM API on port {port}")
+    print(f"💾 Storage: Local JSON + CSV")
     print(f"✅ Validation: Must end with @fam")
+    print(f"⚡ Mode: 100% Synchronous (no async issues)")
     
-    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+    app.run(host='0.0.0.0', port=port, debug=False)
