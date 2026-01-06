@@ -5,178 +5,195 @@ import json
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
 
 app = Flask(__name__)
 
-# Import telethon synchronously
-from telethon.sync import TelegramClient
-from telethon.sessions import StringSession
+# Telegram client will be initialized only when needed
+telegram_client = None
 
-class TelegramFamBot:
-    def __init__(self):
-        self.api_id = int(os.getenv('TELEGRAM_API_ID', 0))
-        self.api_hash = os.getenv('TELEGRAM_API_HASH', '')
-        self.session_string = os.getenv('TELEGRAM_SESSION_STRING', '')
-        self.chat_id = -1003674153946
-        
-        if not all([self.api_id, self.api_hash, self.session_string]):
-            raise ValueError("Missing Telegram credentials")
-        
-        self.client = None
-        self.last_bot_message_id = 0
+def get_telegram_client():
+    """Get Telegram client - initialize only when needed"""
+    global telegram_client
     
-    def connect(self):
-        """Connect to Telegram synchronously"""
-        if not self.client:
-            self.client = TelegramClient(
-                StringSession(self.session_string),
-                self.api_id,
-                self.api_hash
-            )
+    if telegram_client is None:
+        from telethon.sync import TelegramClient
+        from telethon.sessions import StringSession
         
-        if not self.client.is_connected():
-            self.client.start()
-            print(f"✅ Connected as {self.client.get_me().first_name}")
+        api_id = int(os.getenv('TELEGRAM_API_ID', 0))
+        api_hash = os.getenv('TELEGRAM_API_HASH', '')
+        session_string = os.getenv('TELEGRAM_SESSION_STRING', '')
         
-        return self.client
+        if not all([api_id, api_hash, session_string]):
+            raise ValueError("Missing Telegram credentials in environment variables")
+        
+        telegram_client = TelegramClient(
+            StringSession(session_string),
+            api_id,
+            api_hash
+        )
+        telegram_client.start()
+        print(f"✅ Telegram client connected")
     
-    def disconnect(self):
-        """Disconnect from Telegram"""
-        if self.client and self.client.is_connected():
-            self.client.disconnect()
+    return telegram_client
+
+def close_telegram_client():
+    """Close Telegram client if connected"""
+    global telegram_client
+    if telegram_client and telegram_client.is_connected():
+        telegram_client.disconnect()
+        telegram_client = None
+        print("✅ Telegram client disconnected")
+
+def extract_fam_info(text):
+    """Extract FAM information from text response"""
+    info = {}
     
-    def get_fam_info(self, query):
-        """Get FAM information synchronously"""
-        try:
-            # Connect if not connected
-            self.connect()
-            
-            # Send command
-            command = f"/fam {query}"
-            print(f"📤 Sending command: {command}")
-            
-            # Send message
-            self.client.send_message(self.chat_id, command)
-            
-            # Wait a moment for bot to process
-            time.sleep(3)
-            
-            # Get recent messages from bots
-            response_text = None
-            
-            # Check last 15 messages for bot response
-            for message in self.client.iter_messages(self.chat_id, limit=15):
-                if message.sender and message.sender.bot:
-                    print(f"📥 Found bot message: {message.id}")
-                    
-                    # Check text message
-                    if message.message:
-                        if any(keyword in message.message.upper() for keyword in ['FAM ID', 'NAME:', 'PHONE:', 'TYPE:']):
-                            response_text = message.message
-                            break
-                    
-                    # Check for document
-                    elif message.media and hasattr(message.media, 'document'):
-                        try:
-                            # Download file
-                            file_path = self.client.download_media(message, file='temp_doc')
-                            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                                response_text = f.read()
-                            os.remove(file_path)
-                            break
-                        except Exception as e:
-                            print(f"❌ Error reading document: {e}")
-                            continue
-            
-            if response_text:
-                return self.parse_fam_response(response_text)
-            else:
-                print("❌ No bot response found")
-                return None
+    # FAM ID
+    fam_match = re.search(r'FAM ID\s*[:=]\s*([^\n]+)', text, re.IGNORECASE)
+    if not fam_match:
+        fam_match = re.search(r'FAM\s*[:=]\s*([^\n]+)', text, re.IGNORECASE)
+    if fam_match:
+        info['fam_id'] = fam_match.group(1).strip()
+    
+    # NAME
+    name_match = re.search(r'NAME\s*[:=]\s*([^\n]+)', text, re.IGNORECASE)
+    if name_match:
+        info['name'] = name_match.group(1).strip()
+    
+    # PHONE
+    phone_match = re.search(r'PHONE\s*[:=]\s*([^\n]+)', text, re.IGNORECASE)
+    if phone_match:
+        info['phone'] = phone_match.group(1).strip()
+    
+    # TYPE
+    type_match = re.search(r'TYPE\s*[:=]\s*([^\n]+)', text, re.IGNORECASE)
+    if type_match:
+        info['type'] = type_match.group(1).strip().lower()
+    
+    return info
+
+def get_fam_data_from_telegram(query):
+    """Main function to get FAM data from Telegram"""
+    client = None
+    try:
+        # Get client
+        client = get_telegram_client()
+        
+        # Target chat ID
+        chat_id = -1003674153946
+        
+        # Send command
+        command = f"/fam {query}"
+        print(f"📤 Sending to chat {chat_id}: {command}")
+        
+        # Send message
+        client.send_message(chat_id, command)
+        
+        # Wait for bot to respond
+        print("⏳ Waiting for bot response...")
+        time.sleep(5)  # Increased wait time
+        
+        # Get bot response from recent messages
+        response_text = None
+        
+        # Check last 20 messages
+        messages = client.get_messages(chat_id, limit=20)
+        
+        for message in messages:
+            # Check if message is from a bot
+            sender = client.get_entity(message.sender_id)
+            if hasattr(sender, 'bot') and sender.bot:
+                print(f"🤖 Found message from bot: {message.id}")
                 
-        except Exception as e:
-            print(f"❌ Error in get_fam_info: {e}")
-            raise
+                # Check text content
+                if message.message:
+                    message_text = message.message
+                    if any(keyword in message_text.upper() for keyword in ['FAM ID', 'NAME:', 'PHONE:', 'TYPE:', 'FAM:']):
+                        print(f"📝 Found text response")
+                        response_text = message_text
+                        break
+                
+                # Check for document
+                elif message.media:
+                    try:
+                        print("📄 Downloading document...")
+                        # Download file
+                        file_path = client.download_media(message, file='temp_fam')
+                        
+                        # Read file
+                        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            file_content = f.read()
+                            response_text = file_content
+                        
+                        # Clean up
+                        if os.path.exists(file_path):
+                            os.remove(file_path)
+                        
+                        print(f"📖 Read {len(file_content)} chars from document")
+                        break
+                    except Exception as e:
+                        print(f"⚠️ Could not read document: {e}")
+                        continue
+        
+        if response_text:
+            print(f"✅ Got response: {response_text[:100]}...")
+            return extract_fam_info(response_text)
+        else:
+            print("❌ No valid bot response found")
+            return None
+            
+    except Exception as e:
+        print(f"❌ Telegram error: {e}")
+        # Close client on error
+        if client and client.is_connected():
+            client.disconnect()
+        raise
     
-    def parse_fam_response(self, text):
-        """Parse FAM response text"""
-        info = {}
-        
-        # FAM ID
-        fam_match = re.search(r'FAM ID\s*[:=]\s*([^\n\r]+)', text, re.IGNORECASE)
-        if not fam_match:
-            fam_match = re.search(r'FAM\s*[:=]\s*([^\n\r]+)', text, re.IGNORECASE)
-        if fam_match:
-            info['fam_id'] = fam_match.group(1).strip()
-        
-        # NAME
-        name_match = re.search(r'NAME\s*[:=]\s*([^\n\r]+)', text, re.IGNORECASE)
-        if name_match:
-            info['name'] = name_match.group(1).strip()
-        
-        # PHONE
-        phone_match = re.search(r'PHONE\s*[:=]\s*([^\n\r]+)', text, re.IGNORECASE)
-        if phone_match:
-            info['phone'] = phone_match.group(1).strip()
-        
-        # TYPE
-        type_match = re.search(r'TYPE\s*[:=]\s*([^\n\r]+)', text, re.IGNORECASE)
-        if type_match:
-            info['type'] = type_match.group(1).strip().lower()
-        
-        return info
-
-# Global bot instance
-bot_instance = None
-
-def get_bot():
-    """Get or create bot instance"""
-    global bot_instance
-    if bot_instance is None:
-        bot_instance = TelegramFamBot()
-        bot_instance.connect()
-    return bot_instance
+    finally:
+        # Don't disconnect - keep connection alive for next request
+        pass
 
 @app.route('/api', methods=['GET'])
-def api_endpoint():
-    """Main API endpoint"""
+def get_fam_info():
+    """API endpoint - synchronous, simple"""
     query = request.args.get('fam', '').strip()
     
     if not query:
         return jsonify({
+            'success': False,
             'error': 'Missing fam parameter',
             'example': '/api?fam=sugarsingh@fam'
         }), 400
     
+    print(f"🔍 Processing request for: {query}")
+    
     try:
-        bot = get_bot()
-        fam_info = bot.get_fam_info(query)
+        fam_data = get_fam_data_from_telegram(query)
         
-        if fam_info and fam_info.get('fam_id'):
+        if fam_data and fam_data.get('fam_id'):
             return jsonify({
                 'success': True,
                 'query': query,
-                'data': fam_info
+                'data': fam_data
             })
-        elif fam_info:
-            # Partial info
+        elif fam_data:
+            # Partial data
             return jsonify({
                 'success': True,
                 'query': query,
-                'data': fam_info,
+                'data': fam_data,
                 'note': 'Partial information retrieved'
             })
         else:
             return jsonify({
                 'success': False,
-                'error': 'Could not retrieve FAM information',
+                'error': 'No FAM information found',
                 'query': query
             }), 404
             
     except Exception as e:
-        print(f"❌ API Error: {str(e)}")
+        print(f"💥 API Error: {str(e)}")
         return jsonify({
             'success': False,
             'error': str(e),
@@ -184,58 +201,44 @@ def api_endpoint():
         }), 500
 
 @app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    try:
-        bot = get_bot()
-        if bot.client and bot.client.is_connected():
-            status = 'connected'
-        else:
-            status = 'disconnected'
-        
-        return jsonify({
-            'status': 'healthy',
-            'telegram': status,
-            'service': 'FAM API'
-        })
-    except Exception as e:
-        return jsonify({
-            'status': 'degraded',
-            'telegram': 'error',
-            'error': str(e)
-        })
+def health():
+    """Simple health check"""
+    return jsonify({
+        'status': 'ok',
+        'service': 'FAM API',
+        'timestamp': time.time()
+    })
 
 @app.route('/')
 def home():
     """Home page"""
     return jsonify({
         'service': 'Telegram FAM API',
-        'description': 'Get FAM information from Telegram bot',
         'usage': 'GET /api?fam=upi@fam',
-        'example': 'https://' + request.host + '/api?fam=sugarsingh@fam',
+        'example': f'/api?fam=sugarsingh@fam',
         'endpoints': {
             '/api': 'Get FAM information',
-            '/health': 'Health check',
-            '/': 'This page'
+            '/health': 'Health check'
         }
     })
 
-@app.route('/test', methods=['GET'])
-def test_connection():
+@app.route('/test-telegram', methods=['GET'])
+def test_telegram():
     """Test Telegram connection"""
     try:
-        bot = get_bot()
-        me = bot.client.get_me()
+        client = get_telegram_client()
+        me = client.get_me()
+        
         return jsonify({
             'success': True,
-            'user': {
-                'id': me.id,
-                'first_name': me.first_name,
-                'username': me.username,
-                'phone': me.phone
-            },
-            'chat_id': bot.chat_id,
-            'connected': bot.client.is_connected()
+            'telegram': {
+                'connected': client.is_connected(),
+                'user': {
+                    'id': me.id,
+                    'first_name': me.first_name,
+                    'username': me.username
+                }
+            }
         })
     except Exception as e:
         return jsonify({
@@ -243,16 +246,20 @@ def test_connection():
             'error': str(e)
         }), 500
 
+# Close connection when app shuts down
+import atexit
+atexit.register(close_telegram_client)
+
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 10000))
     print(f"🚀 Starting FAM API on port {port}")
     
-    # Initialize bot on startup
+    # Try to initialize Telegram client on startup
     try:
-        get_bot()
-        print("✅ Bot initialized successfully")
+        get_telegram_client()
+        print("✅ Pre-initialized Telegram client")
     except Exception as e:
-        print(f"⚠️ Warning: Bot initialization failed: {e}")
-        print("⚠️ The bot will be initialized on first request")
+        print(f"⚠️ Telegram initialization deferred: {e}")
     
-    app.run(host='0.0.0.0', port=port, debug=False)
+    # Run with single worker, no threading
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=False)
