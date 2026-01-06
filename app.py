@@ -2,6 +2,7 @@ import os
 import re
 import time
 import json
+import tempfile
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
@@ -46,11 +47,16 @@ def close_telegram_client():
         print("✅ Telegram client disconnected")
 
 def extract_fam_info(text):
-    """Extract FAM information from text response"""
+    """Extract FAM information from text file content"""
     info = {}
     
-    # Clean up text
-    text = text.strip()
+    if not text:
+        return info
+    
+    print(f"📖 Parsing text content (length: {len(text)}):")
+    print("-" * 50)
+    print(text[:500])
+    print("-" * 50)
     
     # FAM ID - multiple patterns
     patterns = [
@@ -81,10 +87,58 @@ def extract_fam_info(text):
     if type_match:
         info['type'] = type_match.group(1).strip().lower()
     
+    # If we couldn't extract with patterns, try line by line
+    if not info:
+        lines = text.split('\n')
+        for line in lines:
+            line = line.strip()
+            if ':' in line:
+                key, value = line.split(':', 1)
+                key = key.strip().lower()
+                value = value.strip()
+                
+                if 'fam' in key and 'id' in key:
+                    info['fam_id'] = value
+                elif 'name' in key:
+                    info['name'] = value
+                elif 'phone' in key:
+                    info['phone'] = value
+                elif 'type' in key:
+                    info['type'] = value
+    
+    print(f"✅ Extracted info: {info}")
     return info
 
+def download_and_read_file(client, message):
+    """Download and read the attached .txt file"""
+    try:
+        print(f"📥 Downloading file from message ID: {message.id}")
+        
+        # Create a temporary file
+        with tempfile.NamedTemporaryFile(mode='w+b', delete=False, suffix='.txt') as tmp:
+            temp_path = tmp.name
+        
+        # Download the file
+        download_result = client.download_media(message, file=temp_path)
+        print(f"📁 Downloaded to: {download_result or temp_path}")
+        
+        # Read the file content
+        with open(temp_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+        
+        # Clean up
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        
+        print(f"📄 Read {len(content)} characters from file")
+        return content
+        
+    except Exception as e:
+        print(f"❌ Error downloading/reading file: {e}")
+        return None
+
 def get_fam_data_from_telegram(query):
-    """Main function to get FAM data from Telegram - handles bot's reply chain"""
+    """Main function to get FAM data from Telegram - handles .txt file attachments"""
     client = None
     try:
         # Get client
@@ -102,122 +156,93 @@ def get_fam_data_from_telegram(query):
         sent_message_id = sent_message.id
         print(f"📨 Sent message ID: {sent_message_id}")
         
-        # Wait for bot to respond (initial "fetching" message)
-        print("⏳ Waiting for bot responses...")
+        # Wait for bot to respond
+        print("⏳ Waiting for bot responses (10 seconds)...")
+        time.sleep(10)  # Increased wait time for bot to process and send file
         
-        # Track bot messages
-        bot_messages = []
-        start_time = time.time()
-        timeout = 30  # Maximum wait time in seconds
+        # Get messages after our command
+        messages = client.get_messages(chat_id, min_id=sent_message_id, limit=10)
+        print(f"📨 Found {len(messages)} messages after ours")
         
-        while time.time() - start_time < timeout:
-            # Get recent messages
-            messages = client.get_messages(chat_id, limit=20)
-            
-            for message in messages:
-                # Skip our own message
-                if message.id == sent_message_id:
+        # Look for bot messages with .txt attachments
+        for message in messages:
+            try:
+                # Check if message is from a bot
+                sender = client.get_entity(message.sender_id)
+                if not (hasattr(sender, 'bot') and sender.bot):
                     continue
                 
-                # Check if message is from a bot and after our command
-                if message.id > sent_message_id:
-                    sender = client.get_entity(message.sender_id)
-                    if hasattr(sender, 'bot') and sender.bot:
-                        # Check if this is a reply to our message
-                        if (hasattr(message, 'reply_to') and 
-                            message.reply_to and 
-                            message.reply_to.reply_to_msg_id == sent_message_id):
-                            
-                            bot_messages.append({
-                                'id': message.id,
-                                'text': message.message or '',
-                                'media': message.media,
-                                'date': message.date,
-                                'is_reply': True
-                            })
-                            print(f"💬 Bot replied to our message: ID {message.id}")
-                        
-                        # Also check if it's a direct response (not necessarily a reply)
-                        elif 'fetching' in (message.message or '').lower():
-                            print(f"⏱️ Bot is fetching: {message.message}")
-                        elif any(keyword in (message.message or '').upper() for keyword in ['FAM', 'NAME', 'PHONE', 'TYPE']):
-                            bot_messages.append({
-                                'id': message.id,
-                                'text': message.message or '',
-                                'media': message.media,
-                                'date': message.date,
-                                'is_reply': False
-                            })
-                            print(f"📝 Bot sent response: ID {message.id}")
-            
-            # Check if we have the actual data response (not the "fetching" message)
-            for msg in bot_messages:
-                if msg['text'] and not 'fetching' in msg['text'].lower():
-                    # This looks like the actual response
-                    response_text = msg['text']
+                print(f"🤖 Checking bot message ID: {message.id}")
+                print(f"   📝 Text preview: {message.message[:100] if message.message else 'No text'}")
+                print(f"   📎 Has media: {bool(message.media)}")
+                
+                # Check if this is a reply to our message
+                is_reply = False
+                if hasattr(message, 'reply_to') and message.reply_to:
+                    is_reply = True
+                    reply_to_id = message.reply_to.reply_to_msg_id
+                    print(f"   ↪️ Is reply to ID: {reply_to_id} (our ID: {sent_message_id})")
+                
+                # Check if message has media (the .txt file)
+                if message.media:
+                    print("   📁 Found media attachment, attempting to download...")
                     
-                    # Check if there's media/document
-                    if not response_text.strip() and msg['media']:
-                        try:
-                            print("📄 Downloading document from reply...")
-                            file_path = client.download_media(msg, file='temp_fam_doc')
-                            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                                response_text = f.read()
-                            if os.path.exists(file_path):
-                                os.remove(file_path)
-                        except Exception as e:
-                            print(f"⚠️ Could not read document: {e}")
+                    # Download and read the file
+                    file_content = download_and_read_file(client, message)
                     
-                    if response_text.strip():
-                        print(f"✅ Found actual response: {response_text[:200]}...")
-                        return extract_fam_info(response_text)
-            
-            # Wait before checking again
-            time.sleep(2)
-            
-            # If we have any bot messages but no actual data yet, check documents
-            for msg in bot_messages:
-                if msg['media']:
-                    try:
-                        print("📄 Trying to download media attachment...")
-                        file_path = client.download_media(msg, file='temp_fam_file')
-                        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                            file_content = f.read()
-                        if os.path.exists(file_path):
-                            os.remove(file_path)
-                        
-                        if file_content.strip():
-                            print(f"✅ Found data in document: {file_content[:200]}...")
+                    if file_content:
+                        # Check if this looks like FAM data
+                        if any(keyword in file_content.upper() for keyword in ['FAM ID', 'NAME:', 'PHONE:', 'TYPE:']):
+                            print(f"   ✅ Found FAM data in file!")
                             return extract_fam_info(file_content)
-                    except Exception as e:
-                        print(f"⚠️ Could not process media: {e}")
+                        else:
+                            print(f"   ⚠️ File doesn't contain FAM data")
+                            print(f"   📄 File content preview: {file_content[:200]}...")
+                    else:
+                        print("   ❌ Could not read file content")
+                
+                # Also check message text (just in case)
+                if message.message and any(keyword in message.message.upper() for keyword in ['FAM ID', 'NAME:', 'PHONE:', 'TYPE:']):
+                    print(f"   ✅ Found FAM data in message text!")
+                    return extract_fam_info(message.message)
+                    
+            except Exception as e:
+                print(f"⚠️ Error processing message {message.id}: {e}")
+                continue
         
-        # If timeout, check for any document in the chat
-        print("⏰ Timeout - checking for any documents...")
-        messages = client.get_messages(chat_id, limit=30)
+        # If we didn't find anything, try one more time with more messages
+        print("🔄 Trying with more messages (up to 20)...")
+        messages = client.get_messages(chat_id, limit=20)
+        
         for message in messages:
-            if message.id > sent_message_id:
+            try:
+                # Only check messages after ours
+                if message.id <= sent_message_id:
+                    continue
+                
                 sender = client.get_entity(message.sender_id)
-                if hasattr(sender, 'bot') and sender.bot and message.media:
-                    try:
-                        print("📄 Downloading last document found...")
-                        file_path = client.download_media(message, file='temp_last_doc')
-                        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                            file_content = f.read()
-                        if os.path.exists(file_path):
-                            os.remove(file_path)
+                if not (hasattr(sender, 'bot') and sender.bot):
+                    continue
+                
+                if message.media:
+                    print(f"📁 Checking late bot message ID: {message.id} for file...")
+                    file_content = download_and_read_file(client, message)
+                    
+                    if file_content and any(keyword in file_content.upper() for keyword in ['FAM ID', 'NAME:', 'PHONE:', 'TYPE:']):
+                        print(f"✅ Found late file with FAM data!")
+                        return extract_fam_info(file_content)
                         
-                        if file_content.strip():
-                            print(f"✅ Found data in last document")
-                            return extract_fam_info(file_content)
-                    except Exception as e:
-                        print(f"⚠️ Could not process last document: {e}")
+            except Exception as e:
+                print(f"⚠️ Error processing late message {message.id}: {e}")
+                continue
         
-        print("❌ No valid bot response found after timeout")
+        print("❌ No FAM data found in any bot messages")
         return None
         
     except Exception as e:
         print(f"❌ Telegram error: {e}")
+        import traceback
+        traceback.print_exc()
         raise
     
     finally:
@@ -226,7 +251,7 @@ def get_fam_data_from_telegram(query):
 
 @app.route('/api', methods=['GET'])
 def get_fam_info():
-    """API endpoint - handles bot's reply chain"""
+    """API endpoint - downloads .txt file from bot"""
     query = request.args.get('fam', '').strip()
     
     if not query:
@@ -236,34 +261,35 @@ def get_fam_info():
             'example': '/api?fam=sugarsingh@fam'
         }), 400
     
+    print(f"\n" + "="*60)
     print(f"🔍 Processing request for: {query}")
+    print("="*60)
     
     try:
         fam_data = get_fam_data_from_telegram(query)
         
-        if fam_data and fam_data.get('fam_id'):
+        if fam_data and (fam_data.get('fam_id') or fam_data.get('name') or fam_data.get('phone')):
+            # Ensure fam_id is set (use query if not found)
+            if not fam_data.get('fam_id'):
+                fam_data['fam_id'] = query
+            
             return jsonify({
                 'success': True,
                 'query': query,
                 'data': fam_data
             })
-        elif fam_data:
-            # Partial data
-            return jsonify({
-                'success': True,
-                'query': query,
-                'data': fam_data,
-                'note': 'Partial information retrieved'
-            })
         else:
             return jsonify({
                 'success': False,
-                'error': 'No FAM information found',
-                'query': query
+                'error': 'No FAM information found in bot response',
+                'query': query,
+                'note': 'Bot may have sent data in a format we cannot parse'
             }), 404
             
     except Exception as e:
         print(f"💥 API Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return jsonify({
             'success': False,
             'error': str(e),
@@ -284,13 +310,20 @@ def home():
     """Home page"""
     return jsonify({
         'service': 'Telegram FAM API',
-        'description': 'Gets FAM information from Telegram bot. The bot first sends "fetching..." then replies with actual data.',
+        'description': 'Gets FAM information from Telegram bot. The bot sends data in .txt file attachments.',
         'usage': 'GET /api?fam=upi@fam',
         'example': f'/api?fam=sugarsingh@fam',
+        'example_data': {
+            'fam_id': 'sugarsingh@fam',
+            'name': 'Siddhartha S',
+            'phone': '7993764802',
+            'type': 'contact'
+        },
         'endpoints': {
-            '/api': 'Get FAM information',
+            '/api': 'Get FAM information from .txt file',
             '/health': 'Health check',
-            '/test': 'Test Telegram connection'
+            '/test': 'Test Telegram connection',
+            '/debug': 'Debug bot responses'
         }
     })
 
@@ -301,16 +334,6 @@ def test_telegram():
         client = get_telegram_client()
         me = client.get_me()
         
-        # Try to access the group
-        chat_id = -1003674153946
-        try:
-            chat = client.get_entity(chat_id)
-            chat_title = chat.title if hasattr(chat, 'title') else 'Unknown'
-            chat_access = True
-        except:
-            chat_title = "Access denied"
-            chat_access = False
-        
         return jsonify({
             'success': True,
             'telegram': {
@@ -319,11 +342,6 @@ def test_telegram():
                     'id': me.id,
                     'first_name': me.first_name,
                     'username': me.username
-                },
-                'group': {
-                    'id': chat_id,
-                    'title': chat_title,
-                    'accessible': chat_access
                 }
             }
         })
@@ -335,7 +353,7 @@ def test_telegram():
 
 @app.route('/debug/<query>', methods=['GET'])
 def debug_query(query):
-    """Debug endpoint to see raw bot responses"""
+    """Debug endpoint to see raw bot responses and files"""
     try:
         client = get_telegram_client()
         chat_id = -1003674153946
@@ -344,13 +362,18 @@ def debug_query(query):
         command = f"/fam {query}"
         sent_message = client.send_message(chat_id, command)
         
-        # Wait and collect all messages
+        # Wait for responses
         time.sleep(8)
         
         # Get messages after our command
-        messages = client.get_messages(chat_id, limit=30)
+        messages = client.get_messages(chat_id, limit=15)
         
-        bot_responses = []
+        debug_info = {
+            'query': query,
+            'our_message_id': sent_message.id,
+            'bot_responses': []
+        }
+        
         for msg in messages:
             if msg.id > sent_message.id:
                 try:
@@ -363,27 +386,40 @@ def debug_query(query):
                         'is_bot': is_bot,
                         'text': msg.message or '',
                         'has_media': bool(msg.media),
-                        'is_reply': hasattr(msg, 'reply_to') and bool(msg.reply_to)
+                        'media_type': str(type(msg.media)) if msg.media else None
                     }
                     
-                    # If it's a reply, check what it's replying to
-                    if response_data['is_reply']:
-                        response_data['reply_to_id'] = msg.reply_to.reply_to_msg_id
-                        response_data['is_reply_to_our_command'] = (msg.reply_to.reply_to_msg_id == sent_message.id)
+                    # Try to download and read file if present
+                    if msg.media and is_bot:
+                        try:
+                            with tempfile.NamedTemporaryFile(mode='w+b', delete=False, suffix='.txt') as tmp:
+                                temp_path = tmp.name
+                            
+                            download_path = client.download_media(msg, file=temp_path)
+                            with open(temp_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                file_content = f.read()
+                            
+                            response_data['file_content'] = file_content[:500] + '...' if len(file_content) > 500 else file_content
+                            response_data['file_size'] = len(file_content)
+                            
+                            if os.path.exists(temp_path):
+                                os.remove(temp_path)
+                                
+                        except Exception as file_error:
+                            response_data['file_error'] = str(file_error)
                     
-                    bot_responses.append(response_data)
-                except:
-                    continue
+                    debug_info['bot_responses'].append(response_data)
+                    
+                except Exception as e:
+                    debug_info['bot_responses'].append({
+                        'id': msg.id,
+                        'error': str(e)
+                    })
         
         # Sort by ID (newest first)
-        bot_responses.sort(key=lambda x: x['id'], reverse=True)
+        debug_info['bot_responses'].sort(key=lambda x: x['id'], reverse=True)
         
-        return jsonify({
-            'query': query,
-            'our_message_id': sent_message.id,
-            'bot_responses': bot_responses,
-            'count': len(bot_responses)
-        })
+        return jsonify(debug_info)
         
     except Exception as e:
         return jsonify({
@@ -399,7 +435,7 @@ if __name__ == '__main__':
     port = int(os.getenv('PORT', 10000))
     print(f"🚀 Starting FAM API on port {port}")
     print(f"📱 Target group: -1003674153946")
-    print(f"🤖 Bot behavior: Sends 'fetching...' then replies with data")
+    print(f"📄 Bot sends data in .txt file attachments")
     
     # Try to initialize Telegram client on startup
     try:
